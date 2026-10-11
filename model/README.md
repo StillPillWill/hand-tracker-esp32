@@ -20,9 +20,15 @@ To use a different dataset, pass --data C:\path\to\sideline-soccer\data.yaml to 
 
 For a deployable model, collect video from the exact iPhone, mount position, pitch size, and shooting distance. Sample frames across multiple matches and lighting conditions; annotate ball, players, and referee. Split by entire match and camera position before training so near-duplicate frames do not appear in both train and validation. Inspect ball recall and false locks at the expected distance, then tune confidence and temporal tracking against held-out games.
 
+## Included browser model
+
+The repository includes `soccer-yolo11n-1280.onnx` (11,070,311 bytes). Its SHA-256 is `6A72DD73ECF6790ED4CE8C565835A418906CB08F09871BBF0A337647B9120BB6`. The browser page downloads this file from the repository on first use and stores it in Safari's local IndexedDB when available. Users can instead load a different ONNX model from iPhone Files. This download requires a working phone internet route; after the model is saved, the model bytes remain on the phone.
+
+The export metadata identifies the upstream Ultralytics license as AGPL-3.0. The included model is distributed with the AGPL-3.0 text in `AGPL-3.0.txt`. The source Football Image Dataset is separately licensed CC BY 4.0; its attribution and license are documented above.
+
 ## Load the model in the iPhone page
 
-After training, the fixed-shape ONNX file is written beside `best.pt` under `work/soccer-model/training/yolo11n-soccer/weights/`. Copy that `.onnx` file into iPhone Files (for example, through iCloud Drive or USB transfer), open the ESP32 page in Safari, select the file under **Soccer model**, and tap **Load soccer model** before starting the camera. The page runs inference on the phone and keeps the model bytes there; the ESP32 receives only aim and motor commands.
+For the bundled baseline, open the ESP32 page in Safari and tap **Download + load soccer model**. It downloads the ONNX file through the phone's internet connection and saves it on the phone when browser storage is available. To use a newly trained or different model, copy its `.onnx` file into iPhone Files, choose it under **Use a different soccer model**, and tap **Load chosen model**. In either case inference runs on the phone; the ESP32 receives only aim and motor commands.
 
 The browser decoder expects the YOLO output for a 1280×1280 input with classes in this exact order: `ball`, `player`, `referee`. The current baseline uses confidence thresholds of 0.26 for balls and 0.18 for players/referees. It requests the WebNN NPU device if the browser exposes it, then tries ONNX Runtime WebGPU with WASM fallback, then WASM CPU. The generic MediaPipe COCO detector remains available as the default. The runtime downloads from jsDelivr, so the phone needs an internet route while loading it.
 
