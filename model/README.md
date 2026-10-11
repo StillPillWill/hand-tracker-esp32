@@ -24,6 +24,12 @@ For a deployable model, collect video from the exact iPhone, mount position, pit
 
 After training, the fixed-shape ONNX file is written beside `best.pt` under `work/soccer-model/training/yolo11n-soccer/weights/`. Copy that `.onnx` file into iPhone Files (for example, through iCloud Drive or USB transfer), open the ESP32 page in Safari, select the file under **Soccer model**, and tap **Load soccer model** before starting the camera. The page runs inference on the phone and keeps the model bytes there; the ESP32 receives only aim and motor commands.
 
-The browser decoder expects the YOLO output for a 1280×1280 input with classes in this exact order: `ball`, `player`, `referee`. It requests the WebNN NPU device if the browser exposes it, then tries ONNX Runtime WebGPU with WASM fallback, then WASM CPU. The generic MediaPipe COCO detector remains available as the default. The runtime downloads from jsDelivr, so the phone needs an internet route while loading it.
+The browser decoder expects the YOLO output for a 1280×1280 input with classes in this exact order: `ball`, `player`, `referee`. The current baseline uses confidence thresholds of 0.26 for balls and 0.18 for players/referees. It requests the WebNN NPU device if the browser exposes it, then tries ONNX Runtime WebGPU with WASM fallback, then WASM CPU. The generic MediaPipe COCO detector remains available as the default. The runtime downloads from jsDelivr, so the phone needs an internet route while loading it.
+
+## Baseline run and browser check
+
+The 2026-10-11 YOLO11n run stopped after 40 epochs and exported a 10.6 MB ONNX model. On the 100-image broadcast validation split, aggregate validation was precision 0.747, recall 0.763, mAP50 0.763, and mAP50-95 0.496. A separate check loaded that ONNX file in ONNX Runtime WebGPU and ran the browser's 1280 preprocessing, 0.45 class-wise NMS, and box decoder against all 100 validation images. At IoU 0.50, using confidence thresholds of 0.26 for ball and 0.18 for players/referees, precision/recall was ball 0.485/0.590, player 0.948/0.983, referee 0.813/0.715. This is a runtime/decoder check on broadcast images, not a sideline test or a full mAP benchmark.
+
+The ONNX export metadata identifies the upstream Ultralytics license as AGPL-3.0. Its warm WebGPU inference took 66–106 ms on the local NVIDIA Pascal desktop; that timing does not predict iPhone performance. Measure the target phone's runtime and capture settings at the field.
 
 The baseline's validation metrics come from broadcast frames, not the intended iPhone sideline viewpoint. Do not treat those scores as proof of sideline recall. Measure ball recall and false locks from held-out games recorded at the actual mount position before relying on automatic tracking.

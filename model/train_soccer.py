@@ -75,7 +75,10 @@ def main() -> None:
 
     best_checkpoint = OUTPUT_DIR / "yolo11n-soccer" / "weights" / "best.pt"
     best_model = YOLO(str(best_checkpoint))
-    metrics = best_model.val(data=str(dataset_yaml), imgsz=args.imgsz, device=device, split="val")
+    metrics = best_model.val(
+        data=str(dataset_yaml), imgsz=args.imgsz, device=device, split="val",
+        project=str(OUTPUT_DIR), name="yolo11n-soccer-validation", exist_ok=True,
+    )
     per_class_metrics = {}
     for metric_index, class_index in enumerate(metrics.box.ap_class_index):
         precision, recall, map50, map50_95 = metrics.box.class_result(metric_index)

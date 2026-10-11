@@ -260,6 +260,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const ORT_DIST = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
     const SOCCER_INPUT_SIZE = 1280;
     const SOCCER_CLASS_NAMES = ['ball', 'player', 'referee'];
+    const SOCCER_CLASS_THRESHOLDS = [0.26, 0.18, 0.18];
 
     function createSoccerOrtDetector(ort, session, provider) {
       const inputName = session.inputNames[0];
@@ -305,7 +306,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
             const score = at(4 + classIndex, index);
             if (score > confidence) { confidence = score; classId = classIndex; }
           }
-          if (confidence < 0.18 || classId < 0) continue;
+          if (classId < 0 || confidence < SOCCER_CLASS_THRESHOLDS[classId]) continue;
           const centerX = at(0, index);
           const centerY = at(1, index);
           const width = at(2, index);
