@@ -47,7 +47,13 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <label class="setting">Track mode
       <select id="trackMode"><option value="play">Focus of play</option><option value="ball">Ball only</option><option value="players">Active player group</option></select>
     </label>
-    <p class="small">Focus of play combines ball position and motion with nearby players, then scores player groups by movement toward the play, activity, density, and continuity when the ball is hidden.</p>
+    <p class="small">Focus of play combines the ball and nearby players when visible. During occlusion it predicts the ball, then uses its fading recent position to score player groups by proximity, movement, convergence, activity, and continuity.</p>
+    <label class="setting">Soccer model (.onnx, optional)
+      <input id="soccerModelFile" type="file" accept=".onnx,application/octet-stream">
+    </label>
+    <div class="row"><button id="loadSoccerModel" class="secondary" disabled>Load soccer model</button><button id="loadSavedSoccerModel" class="secondary" disabled>Load saved model</button><button id="useGenericDetector" class="secondary" disabled>Use general detector</button></div>
+    <p class="small">Choose the trained three-class soccer model from iPhone Files and load it once. Safari saves it on this phone when storage is available; the ONNX runtime downloads through the phone's internet connection.</p>
+    <p id="detectorReadout" class="small">Active detector: general COCO model. Choose a soccer ONNX file to replace it.</p>
     <label class="setting">Maximum zoom: <span id="maxZoomReadout" class="readout">3.0×</span>
       <input id="maxZoom" type="range" min="1" max="4" step="0.1" value="3">
     </label>
@@ -57,7 +63,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <label class="check"><input id="autoZoom" type="checkbox" checked><span>Auto-frame the detected play</span></label>
     <div class="row"><button id="record" class="secondary" disabled>Record clip</button><button id="stopRecord" class="secondary" disabled>Stop &amp; save clip</button></div>
     <p class="small">The page requests up to 4K at 30 fps and shows the camera settings the phone actually supplies. When auto-framing can zoom, recording uses a full-resolution crop surface so the saved view follows the play; hardware camera zoom is also applied when available. The crop uses phone camera frames, preserving any stabilization supplied by its camera pipeline; tracking smoothing and motor acceleration limits also ease turret motion. With auto-framing off, it records the camera stream directly. Microphone access is requested only when recording starts.</p>
-    <p class="small">Detection runs on the iPhone. MediaPipe tries its GPU delegate, then CPU/WASM. Current Safari iOS does not provide this page with a supported Core ML/Neural Engine execution provider, so the page reports GPU/CPU delegate status instead of claiming Neural Engine use.</p>
+    <p class="small">Detection and the selected model stay on the iPhone. The custom soccer ONNX path requests a WebNN NPU when available, then tries WebGPU with WASM fallback, then WASM CPU. WebGPU uses the phone GPU; Safari support for a direct Core ML/Neural Engine provider is not currently listed.</p>
     <a id="lastClip" class="clip" hidden></a>
   </div>
 
@@ -86,11 +92,18 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const maxZoom = document.querySelector('#maxZoom');
     const autoZoom = document.querySelector('#autoZoom');
     const trackMode = document.querySelector('#trackMode');
+    const soccerModelFile = document.querySelector('#soccerModelFile');
+    const loadSoccerModelBtn = document.querySelector('#loadSoccerModel');
+    const loadSavedSoccerModelBtn = document.querySelector('#loadSavedSoccerModel');
+    const useGenericDetectorBtn = document.querySelector('#useGenericDetector');
+    const detectorReadout = document.querySelector('#detectorReadout');
     const recordBtn = document.querySelector('#record');
     const stopRecordBtn = document.querySelector('#stopRecord');
     const lastClip = document.querySelector('#lastClip');
 
-    let detector = null, stream = null, running = false, motorsEnabled = false;
+    let detector = null, detectorKind = 'coco', detectorBusy = false, detectorFailed = false;
+    let genericDelegate = 'GPU', modelLoading = false;
+    let stream = null, running = false, motorsEnabled = false, startToken = 0;
     let lastInfer = 0, lastSend = 0, lastLockAt = 0, settingsTimer = 0;
     let detections = [], filteredX = 0.5, filteredY = 0.5, currentZoom = 1;
     let videoTrack = null, hardwareZoomRange = null, hardwareZoomActive = false;
@@ -208,6 +221,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     async function setupDetector() {
+      genericDelegate = 'GPU';
       status('Loading MediaPipe object-detection code…');
       let vision;
       try {
@@ -233,12 +247,298 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       } catch (gpuError) {
         status('GPU delegate unavailable; retrying on the phone CPU…');
         options.baseOptions.delegate = 'CPU';
+        genericDelegate = 'CPU';
         try {
           return await vision.ObjectDetector.createFromOptions(files, options);
         } catch (cpuError) {
           throw new Error(`Object model setup failed. GPU: ${gpuError?.message || gpuError}. CPU: ${cpuError?.message || cpuError}`);
         }
       }
+    }
+
+    const ORT_VERSION = '1.30.0';
+    const ORT_DIST = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
+    const SOCCER_INPUT_SIZE = 1280;
+    const SOCCER_CLASS_NAMES = ['ball', 'player', 'referee'];
+
+    function createSoccerOrtDetector(ort, session, provider) {
+      const inputName = session.inputNames[0];
+      const outputName = session.outputNames[0];
+      const inputSize = SOCCER_INPUT_SIZE;
+      const area = inputSize * inputSize;
+      const inputData = new Float32Array(area * 3);
+      const inputCanvas = document.createElement('canvas');
+      inputCanvas.width = inputCanvas.height = inputSize;
+      const inputContext = inputCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
+      if (!inputContext) throw new Error('Could not create the phone-side model input canvas.');
+
+      function iou(a, b) {
+        const left = Math.max(a.left, b.left);
+        const top = Math.max(a.top, b.top);
+        const right = Math.min(a.right, b.right);
+        const bottom = Math.min(a.bottom, b.bottom);
+        const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
+        const union = (a.right - a.left) * (a.bottom - a.top) + (b.right - b.left) * (b.bottom - b.top) - intersection;
+        return union > 0 ? intersection / union : 0;
+      }
+
+      function decode(output, sourceWidth, sourceHeight, scale, padX, padY) {
+        const dims = output.dims || [];
+        if (dims.length !== 3 || dims[0] !== 1) {
+          throw new Error(`Expected a fixed-batch YOLO output, got [${dims.join(', ')}].`);
+        }
+        const features = SOCCER_CLASS_NAMES.length + 4;
+        const channelsFirst = dims[1] === features;
+        const channelsLast = dims[2] === features;
+        if (!channelsFirst && !channelsLast) {
+          throw new Error(`Expected ${features} YOLO features (box + ball/player/referee), got [${dims.join(', ')}].`);
+        }
+        const candidates = channelsFirst ? dims[2] : dims[1];
+        const at = (feature, index) => channelsFirst
+          ? output.data[feature * candidates + index]
+          : output.data[index * features + feature];
+        const boxes = [];
+        for (let index = 0; index < candidates; index++) {
+          let classId = -1;
+          let confidence = 0;
+          for (let classIndex = 0; classIndex < SOCCER_CLASS_NAMES.length; classIndex++) {
+            const score = at(4 + classIndex, index);
+            if (score > confidence) { confidence = score; classId = classIndex; }
+          }
+          if (confidence < 0.18 || classId < 0) continue;
+          const centerX = at(0, index);
+          const centerY = at(1, index);
+          const width = at(2, index);
+          const height = at(3, index);
+          if (![centerX, centerY, width, height, confidence].every(Number.isFinite) || width <= 0 || height <= 0) continue;
+          const left = clamp((centerX - width / 2 - padX) / scale, 0, sourceWidth);
+          const top = clamp((centerY - height / 2 - padY) / scale, 0, sourceHeight);
+          const right = clamp((centerX + width / 2 - padX) / scale, 0, sourceWidth);
+          const bottom = clamp((centerY + height / 2 - padY) / scale, 0, sourceHeight);
+          if (right - left < 1 || bottom - top < 1) continue;
+          boxes.push({ left, top, right, bottom, confidence, classId });
+        }
+
+        boxes.sort((a, b) => b.confidence - a.confidence);
+        const selected = [];
+        for (const box of boxes) {
+          if (selected.some(other => other.classId === box.classId && iou(other, box) > 0.45)) continue;
+          selected.push(box);
+          if (selected.length >= 40) break;
+        }
+        return selected.map(box => ({
+          boundingBox: {
+            originX: box.left, originY: box.top,
+            width: box.right - box.left, height: box.bottom - box.top
+          },
+          categories: [{ categoryName: SOCCER_CLASS_NAMES[box.classId], score: box.confidence }]
+        }));
+      }
+
+      return {
+        provider,
+        async warmup() {
+          inputData.fill(0);
+          const tensor = new ort.Tensor('float32', inputData, [1, 3, inputSize, inputSize]);
+          const outputs = await session.run({ [inputName]: tensor });
+          const output = outputs[outputName] || outputs[Object.keys(outputs)[0]];
+          if (!output) throw new Error('The soccer model returned no output tensor.');
+          decode(output, inputSize, inputSize, 1, 0, 0);
+        },
+        async detectForVideo(source) {
+          const sourceWidth = source.videoWidth;
+          const sourceHeight = source.videoHeight;
+          if (!sourceWidth || !sourceHeight) return { detections: [] };
+          const scale = Math.min(inputSize / sourceWidth, inputSize / sourceHeight);
+          const resizedWidth = Math.round(sourceWidth * scale);
+          const resizedHeight = Math.round(sourceHeight * scale);
+          const padX = Math.floor((inputSize - resizedWidth) / 2);
+          const padY = Math.floor((inputSize - resizedHeight) / 2);
+          inputContext.fillStyle = 'rgb(114,114,114)';
+          inputContext.fillRect(0, 0, inputSize, inputSize);
+          inputContext.drawImage(source, 0, 0, sourceWidth, sourceHeight,
+            padX, padY, resizedWidth, resizedHeight);
+          const pixels = inputContext.getImageData(0, 0, inputSize, inputSize).data;
+          for (let pixel = 0; pixel < area; pixel++) {
+            const rgba = pixel * 4;
+            inputData[pixel] = pixels[rgba] / 255;
+            inputData[area + pixel] = pixels[rgba + 1] / 255;
+            inputData[2 * area + pixel] = pixels[rgba + 2] / 255;
+          }
+          const tensor = new ort.Tensor('float32', inputData, [1, 3, inputSize, inputSize]);
+          const outputs = await session.run({ [inputName]: tensor });
+          const output = outputs[outputName] || outputs[Object.keys(outputs)[0]];
+          return { detections: decode(output, sourceWidth, sourceHeight, scale, padX, padY) };
+        },
+        close() { session.release?.(); }
+      };
+    }
+
+    async function setupSoccerDetector(modelBytes) {
+      modelBytes = modelBytes instanceof Uint8Array ? modelBytes : new Uint8Array(modelBytes);
+      if (!modelBytes.byteLength) throw new Error('The selected model file is empty.');
+      const providers = [];
+      if (navigator.ml) providers.push('webnn');
+      if (navigator.gpu) providers.push('webgpu');
+      providers.push('wasm');
+      let lastError = null;
+      for (const provider of providers) {
+        try {
+          status(provider === 'webnn'
+            ? 'Loading ONNX Runtime and requesting the phone NPU…'
+            : provider === 'webgpu'
+              ? 'Loading ONNX Runtime and trying iPhone WebGPU…'
+              : 'Loading ONNX Runtime WebAssembly fallback…');
+          const runtimeFile = provider === 'webnn' ? 'ort.all.min.mjs'
+            : provider === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs';
+          const runtimeUrl = `${ORT_DIST}${runtimeFile}`;
+          const ort = await import(runtimeUrl);
+          ort.env.wasm.wasmPaths = ORT_DIST;
+          ort.env.wasm.numThreads = 1;
+          const executionProviders = provider === 'webnn'
+            ? [{ name: 'webnn', deviceType: 'npu', powerPreference: 'high-performance' }, 'wasm']
+            : provider === 'webgpu' ? ['webgpu', 'wasm'] : ['wasm'];
+          const session = await ort.InferenceSession.create(modelBytes, {
+            executionProviders, graphOptimizationLevel: 'all', logSeverityLevel: 3
+          });
+          let detector = null;
+          try {
+            detector = createSoccerOrtDetector(ort, session, provider);
+            status(provider === 'webnn' ? 'Preparing the soccer model on WebNN NPU…'
+              : provider === 'webgpu' ? 'Preparing the soccer model on WebGPU…' : 'Preparing the soccer model on WASM…');
+            await detector.warmup();
+            return detector;
+          } catch (error) {
+            detector?.close?.();
+            session.release?.();
+            throw error;
+          }
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw new Error(`Could not create the soccer detector. Check cellular access for the ONNX runtime. ${lastError?.message || lastError || ''}`);
+    }
+
+    function openSoccerModelDatabase() {
+      return new Promise((resolve, reject) => {
+        if (!window.indexedDB) { reject(new Error('This browser has no local model storage.')); return; }
+        const request = indexedDB.open('soccer-turret-models', 1);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains('models')) request.result.createObjectStore('models');
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('Could not open local model storage.'));
+      });
+    }
+
+    async function readSavedSoccerModel() {
+      const database = await openSoccerModelDatabase();
+      try {
+        return await new Promise((resolve, reject) => {
+          const request = database.transaction('models', 'readonly').objectStore('models').get('active');
+          request.onsuccess = () => resolve(request.result || null);
+          request.onerror = () => reject(request.error || new Error('Could not read the saved soccer model.'));
+        });
+      } finally {
+        database.close();
+      }
+    }
+
+    async function saveSoccerModel(modelBytes, name) {
+      const database = await openSoccerModelDatabase();
+      try {
+        await new Promise((resolve, reject) => {
+          const transaction = database.transaction('models', 'readwrite');
+          const copy = modelBytes.buffer.slice(modelBytes.byteOffset, modelBytes.byteOffset + modelBytes.byteLength);
+          transaction.objectStore('models').put({ name, bytes: copy, size: modelBytes.byteLength }, 'active');
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(transaction.error || new Error('Could not save the soccer model.'));
+          transaction.onabort = () => reject(transaction.error || new Error('Local model storage is full.'));
+        });
+        return true;
+      } finally {
+        database.close();
+      }
+    }
+
+    async function refreshSavedSoccerModelButton() {
+      try {
+        const saved = await readSavedSoccerModel();
+        loadSavedSoccerModelBtn.disabled = !saved || running || modelLoading;
+        loadSavedSoccerModelBtn.textContent = saved
+          ? `Load saved soccer model (${(saved.size / 1048576).toFixed(1)} MB)`
+          : 'Load saved model';
+      } catch (_) {
+        loadSavedSoccerModelBtn.disabled = true;
+        loadSavedSoccerModelBtn.textContent = 'Load saved model';
+      }
+    }
+
+    refreshSavedSoccerModelButton();
+
+    async function activateSoccerModel(readModelBytes, modelName, remember) {
+      if (running || modelLoading) throw new Error('Stop the camera before changing its detector.');
+      modelLoading = true;
+      startBtn.disabled = true;
+      soccerModelFile.disabled = true;
+      loadSoccerModelBtn.disabled = true;
+      loadSavedSoccerModelBtn.disabled = true;
+      try {
+        const modelBytes = await readModelBytes();
+        status(`Loading soccer model (${(modelBytes.byteLength / 1048576).toFixed(1)} MB)…`);
+        const soccerDetector = await setupSoccerDetector(modelBytes);
+        detector?.close?.();
+        detector = soccerDetector;
+        detectorKind = 'soccer';
+        detectorFailed = false;
+        useGenericDetectorBtn.disabled = false;
+        const providerLabel = soccerDetector.provider === 'webnn' ? 'WebNN NPU requested'
+          : soccerDetector.provider === 'webgpu' ? 'WebGPU with WASM fallback' : 'WebAssembly CPU';
+        detectorReadout.textContent = `Active detector: soccer YOLO (${modelName}) · ${providerLabel}`;
+        if (remember) {
+          let saved = false;
+          try { saved = await saveSoccerModel(modelBytes, modelName); } catch (_) {}
+          await refreshSavedSoccerModelButton();
+          status(saved
+            ? 'Soccer model loaded and saved on this phone. Start the rear camera to track play.'
+            : 'Soccer model loaded for this session. Browser storage was unavailable; select the file again after reloading.');
+        } else {
+          status('Saved soccer model loaded on the phone. Start the rear camera to track play.');
+        }
+      } finally {
+        modelLoading = false;
+        startBtn.disabled = running;
+        soccerModelFile.disabled = running;
+        loadSoccerModelBtn.disabled = running || !soccerModelFile.files?.length;
+        await refreshSavedSoccerModelButton();
+      }
+    }
+
+    async function loadSoccerModel() {
+      const file = soccerModelFile.files?.[0];
+      if (!file) throw new Error('Choose the soccer .onnx file first.');
+      return activateSoccerModel(() => file.arrayBuffer().then(bytes => new Uint8Array(bytes)), file.name, true);
+    }
+
+    async function loadSavedSoccerModel() {
+      const saved = await readSavedSoccerModel();
+      if (!saved?.bytes) throw new Error('There is no saved soccer model on this phone.');
+      return activateSoccerModel(() => Promise.resolve(new Uint8Array(saved.bytes)), saved.name || 'saved model', false);
+    }
+
+    function useGenericDetector() {
+      if (running || modelLoading) {
+        status('Stop the camera before changing its detector.');
+        return;
+      }
+      detector?.close?.();
+      detector = null;
+      detectorKind = 'coco';
+      detectorFailed = false;
+      useGenericDetectorBtn.disabled = true;
+      detectorReadout.textContent = 'Active detector: general COCO model. Choose a soccer ONNX file to replace it.';
+      status('General COCO detector selected. Start the camera to load it.');
     }
 
     function readDetection(detection) {
@@ -361,6 +661,21 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         const y = group.reduce((sum, player) => sum + player.cy * Math.max(0.15, player.score) * (1 + player.motion * 0.7), 0) / totalWeight;
         const averageMotion = group.reduce((sum, player) => sum + player.motion, 0) / group.length;
         const averageConfidence = group.reduce((sum, player) => sum + player.score, 0) / group.length;
+        const activeFraction = group.filter(player => player.motion >= 0.12).length / group.length;
+        const meanRadius = group.reduce((sum, player) => sum + Math.hypot(player.cx - x, player.cy - y), 0) / group.length;
+        const compactness = clamp(1 - meanRadius / radius, 0, 1);
+        let convergence = 0;
+        let movingCount = 0;
+        for (const player of group) {
+          const dx = x - player.cx;
+          const dy = y - player.cy;
+          const distance = Math.hypot(dx, dy);
+          const speed = Math.hypot(player.vx, player.vy);
+          if (distance < 0.015 || speed < 0.02) continue;
+          convergence += Math.max(0, (player.vx * dx + player.vy * dy) / (speed * distance));
+          movingCount++;
+        }
+        convergence = movingCount ? convergence / movingCount : 0;
         const hintConfidence = ballHint?.focusConfidence ?? 1;
         const ballProximity = ballHint
           ? Math.max(0, 1 - Math.hypot(x - ballHint.cx, y - ballHint.cy) / 0.45) * hintConfidence
@@ -369,9 +684,14 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         const continuity = previousPlayFocus
           ? Math.max(0, 1 - Math.hypot(x - previousPlayFocus.x, y - previousPlayFocus.y) / 0.38)
           : 0;
-        const score = group.length * 0.55 + averageMotion * 1.15 + averageConfidence * 0.3
-          + ballProximity * 1.2 + engagement * 1.1 + continuity * 0.45;
-        if (!best || score > best.score) best = { group, x, y, score, engagement };
+        const groupSize = clamp((group.length - 1) / 4, 0, 1);
+        const score = groupSize * 0.32 + averageMotion * 0.20 + activeFraction * 0.10
+          + ballProximity * 0.26 + engagement * 0.22 + convergence * 0.14
+          + continuity * 0.18 + compactness * 0.12 + averageConfidence * 0.06;
+        if (!best || score > best.score) {
+          best = { group, x, y, score, engagement, activity: averageMotion, activeFraction,
+            convergence, ballProximity, continuity, compactness, hintConfidence };
+        }
       }
       return best;
     }
@@ -391,7 +711,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       return { x: x / totalWeight, y: y / totalWeight };
     }
 
-    function calculateFocusOfPlay(ball, predictedBall, players) {
+    function calculateFocusOfPlay(ball, predictedBall, players, ballHint = null) {
       const playAnchor = ball || predictedBall;
       if (playAnchor) {
         const nearbyPlayers = players.filter(player => Math.hypot(player.cx - playAnchor.cx, player.cy - playAnchor.cy) < 0.34);
@@ -405,12 +725,15 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         };
       }
 
-      const group = activePlayerGroup(players, null);
+      const group = activePlayerGroup(players, ballHint);
       if (!group) return null;
+      const source = group.ballProximity > 0.15
+        ? 'active group near recent ball position'
+        : 'active player group';
       return {
         target: { x: group.x, y: group.y },
         framingSubjects: group.group,
-        label: `Play focus · active group of ${group.group.length} players`
+        label: `Play focus · ${source}, ${group.group.length} players`
       };
     }
 
@@ -429,7 +752,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
 
     function updateTracking(result, now) {
       detections = (result.detections || []).map(readDetection).filter(Boolean);
-      const players = detections.filter(d => d.name === 'person' || d.name === 'player' || d.name === 'referee');
+      const players = detections.filter(d => d.name === 'person' || d.name === 'player');
       const balls = detections.filter(d => d.name === 'sports ball' || d.name === 'ball');
       updatePlayerMotion(players, now);
       const ball = chooseBall(balls, now);
@@ -444,7 +767,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         framingSubjects = [ball];
         focusLabel = 'Ball only · ' + Math.round(ball.score * 100) + '%';
       } else if (trackMode.value === 'play') {
-        const focus = calculateFocusOfPlay(ball, predicted, players);
+        const focus = calculateFocusOfPlay(ball, predicted, players, playHint);
         if (focus) {
           target = focus.target;
           framingSubjects = focus.framingSubjects;
@@ -552,10 +875,21 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     function frame(now) {
       if (!running) return;
       if (video.readyState >= 2) {
-        if (detector && now - lastInfer >= 120) {
+        if (detector && !detectorBusy && !detectorFailed && now - lastInfer >= 120) {
           lastInfer = now;
-          try { updateTracking(detector.detectForVideo(video, now), now); }
-          catch (error) { status(`Detection error: ${error?.message || error}`); }
+          detectorBusy = true;
+          try {
+            Promise.resolve(detector.detectForVideo(video, now))
+              .then(result => { if (running) updateTracking(result, performance.now()); })
+              .catch(error => {
+                detectorFailed = true;
+                status(`Detection stopped: ${error?.message || error}. Reload the model or use the generic detector.`);
+              })
+              .finally(() => { detectorBusy = false; });
+          } catch (error) {
+            detectorBusy = false;
+            status(`Detection error: ${error?.message || error}`);
+          }
         }
         drawFrame(now);
       } else {
@@ -564,7 +898,12 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     async function startCameraAndTracking() {
+      if (modelLoading) return;
+      const request = ++startToken;
       startBtn.disabled = true;
+      soccerModelFile.disabled = true;
+      loadSoccerModelBtn.disabled = true;
+      loadSavedSoccerModelBtn.disabled = true;
       try {
         if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
           throw new Error('Camera access needs HTTPS. Open https://192.168.4.1:8000 and accept the ESP32 certificate first.');
@@ -607,16 +946,29 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           await video.play();
           updateCameraReadout();
         }
+        if (request !== startToken) return;
         stopBtn.disabled = false;
         recordBtn.disabled = false;
+        if (!detector) {
+          detector = await setupDetector();
+          detectorKind = 'coco';
+          detectorFailed = false;
+          useGenericDetectorBtn.disabled = true;
+          detectorReadout.textContent = `Active detector: general COCO · MediaPipe ${genericDelegate}`;
+        }
+        if (request !== startToken) return;
+        detectorFailed = false;
         if (!running) { running = true; requestAnimationFrame(frame); }
-        if (!detector) detector = await setupDetector();
         status('Tracking live. The phone sends only yaw/pitch targets to the ESP32.');
         startBtn.textContent = 'Tracker running';
       } catch (error) {
+        if (request !== startToken) return;
         status(stream ? `Camera is on, but tracker setup failed: ${error?.message || error}` : `Could not start camera: ${error?.message || error}`);
         startBtn.textContent = detector ? 'Retry' : stream ? 'Retry tracker' : 'Start camera + tracker';
         startBtn.disabled = false;
+        soccerModelFile.disabled = false;
+        loadSoccerModelBtn.disabled = !soccerModelFile.files?.length;
+        await refreshSavedSoccerModelButton();
       }
     }
 
@@ -651,15 +1003,21 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     async function stopCamera() {
+      startToken++;
       running = false;
       if (recorder && recorder.state !== 'inactive') await stopAndSaveRecording();
-      detector?.close(); detector = null;
+      if (detectorKind !== 'soccer') {
+        detector?.close?.(); detector = null;
+      }
       stream?.getTracks().forEach(track => track.stop());
       stream = null; video.srcObject = null;
       videoTrack = null; hardwareZoomRange = null; hardwareZoomActive = false; hardwareZoomPending = false;
       updateCameraReadout();
       recordBtn.disabled = true; stopBtn.disabled = true;
       startBtn.disabled = false; startBtn.textContent = 'Start camera + tracker';
+      soccerModelFile.disabled = false;
+      loadSoccerModelBtn.disabled = !soccerModelFile.files?.length;
+      await refreshSavedSoccerModelButton();
       detections = []; trackingState.textContent = 'No camera';
       try { await fetch('/stop', { method: 'POST' }); } catch (_) {}
       status(motorsEnabled ? 'Camera stopped. Motors are holding their current position.' : 'Camera stopped. Motors remain disabled.');
@@ -678,6 +1036,16 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     autoZoom.addEventListener('change', () => { if (!autoZoom.checked) currentZoom = 1; });
     startBtn.addEventListener('click', startCameraAndTracking);
     stopBtn.addEventListener('click', stopCamera);
+    loadSavedSoccerModelBtn.addEventListener('click', () => {
+      loadSavedSoccerModel().catch(error => status(`Saved soccer model failed: ${error?.message || error}`));
+    });
+    soccerModelFile.addEventListener('change', () => {
+      loadSoccerModelBtn.disabled = running || !soccerModelFile.files?.length;
+    });
+    loadSoccerModelBtn.addEventListener('click', () => {
+      loadSoccerModel().catch(error => status(`Soccer model failed: ${error?.message || error}`));
+    });
+    useGenericDetectorBtn.addEventListener('click', useGenericDetector);
 
     document.querySelectorAll('[data-dx], [data-dy]').forEach(button => button.addEventListener('click', () => {
       if (running) { status('Stop tracking before using manual aim.'); return; }

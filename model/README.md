@@ -20,4 +20,10 @@ To use a different dataset, pass --data C:\path\to\sideline-soccer\data.yaml to 
 
 For a deployable model, collect video from the exact iPhone, mount position, pitch size, and shooting distance. Sample frames across multiple matches and lighting conditions; annotate ball, players, and referee. Split by entire match and camera position before training so near-duplicate frames do not appear in both train and validation. Inspect ball recall and false locks at the expected distance, then tune confidence and temporal tracking against held-out games.
 
-The current ESP32 web page still runs the generic MediaPipe COCO model. Integrating this custom YOLO export requires the browser ONNX runtime and its output decoder; it should replace the COCO detector only after the model is evaluated on sideline footage and the iPhone's Safari runtime is measured.
+## Load the model in the iPhone page
+
+After training, the fixed-shape ONNX file is written beside `best.pt` under `work/soccer-model/training/yolo11n-soccer/weights/`. Copy that `.onnx` file into iPhone Files (for example, through iCloud Drive or USB transfer), open the ESP32 page in Safari, select the file under **Soccer model**, and tap **Load soccer model** before starting the camera. The page runs inference on the phone and keeps the model bytes there; the ESP32 receives only aim and motor commands.
+
+The browser decoder expects the YOLO output for a 1280×1280 input with classes in this exact order: `ball`, `player`, `referee`. It requests the WebNN NPU device if the browser exposes it, then tries ONNX Runtime WebGPU with WASM fallback, then WASM CPU. The generic MediaPipe COCO detector remains available as the default. The runtime downloads from jsDelivr, so the phone needs an internet route while loading it.
+
+The baseline's validation metrics come from broadcast frames, not the intended iPhone sideline viewpoint. Do not treat those scores as proof of sideline recall. Measure ball recall and false locks from held-out games recorded at the actual mount position before relying on automatic tracking.
