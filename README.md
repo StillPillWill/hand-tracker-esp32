@@ -1,49 +1,61 @@
-# ESP32 hand tracker
+# ESP32 Soccer Camera Turret
 
-This starter uses an ESP32 access point, an HTTPS page served by the ESP32, browser-based MediaPipe Hand Landmarker, and a STEP/DIR stepper driver such as an A4988 or DRV8825.
+This branch turns the hand-tracker prototype into a two-axis soccer camera turret. The ESP32 is a local yaw/pitch motor controller; the iPhone supplies the rear camera, object detection, framing, and recording UI.
 
-## Why HTTPS and why not `localhost`
+## Current prototype
 
-On a phone, `localhost` means the phone itself. It does not mean the ESP32. The ESP32 is `192.168.4.1` on its access point.
+- The ESP32 starts an open access point named `SoccerTurret-ESP32` and serves an HTTPS control page at `https://192.168.4.1:8000`.
+- The iPhone page requests the rear camera and microphone. It runs MediaPipe Object Detector on the phone, looks for COCO `person` and `sports ball` detections, smooths the target, and sends only normalized x/y coordinates to the ESP32.
+- The page can frame the ball and nearby players with a digital crop, show boxes, and record the composed view with microphone audio where iPhone Safari supports canvas recording.
+- The ESP32 controls independent yaw and pitch STEP/DIR drivers with bounded PID speed control, acceleration limiting, and software travel limits. Motor power starts disabled. **STOP holds position; the motor toggle releases driver torque.**
 
-Phone browsers also restrict camera access to secure pages. This project serves the control page from the ESP32 over HTTPS on port 8000. It creates a self-signed certificate at startup; the first visit will show a certificate warning. Continue to `https://192.168.4.1:8000`, then allow camera access. The certificate warning is expected for this local prototype.
+The default model is Google's [EfficientDet-Lite0 COCO model](https://developers.google.com/edge/mediapipe/solutions/vision/object_detector). It recognizes general `person` and `sports ball` classes; it is not a soccer-trained model and may miss a small ball across a full-size field. Treat this as a first field prototype, not dependable game coverage. A soccer-specific detector and temporal ball tracker will likely be needed.
 
-## Hardware assumed
+## iPhone and zoom limits
 
-- Classic ESP32 DevKit / ESP32-WROOM board
-- A4988 or DRV8825 stepper driver (STEP/DIR interface)
-- A bipolar stepper motor and a separate motor power supply sized for the motor
-- GPIO 26 to STEP, GPIO 27 to DIR, GPIO 25 to ENABLE (optional; active LOW)
-- Driver logic ground and ESP32 ground connected together
+The current web version digitally crops the camera stream and records the cropped canvas. That works as a browser-side zoom control but reduces detail as it zooms in. It does not switch iPhone lenses or directly command optical/hardware zoom. Apple exposes smooth capture zoom through AVFoundation's `videoZoomFactor` and ramp API, so a native iOS camera app is the path to reliable lens control and full-quality recording. ONNX Runtime's current browser support table lists WebAssembly on iOS Safari but not its WebGPU execution provider; the web prototype therefore has CPU/WASM fallback and must be measured on the actual iPhone.
 
-Do not connect a stepper motor directly to ESP32 pins. Set the driver's current limit for your motor before powering it. This prototype assumes the head is mechanically centered when the ESP32 boots; it has no limit switch or homing sensor. Keep travel clear and adjust the software angle limits to your mechanism.
+The model runtime and model file download from Google's and jsDelivr's servers on first start. The ESP32 AP has no internet connection; the iPhone must still be able to reach those hosts over cellular. Camera video is not sent over Wi-Fi. Only the x/y target requests reach the ESP32.
 
-## Build and flash
+## Hardware
 
-1. Install PlatformIO (VS Code extension or `pio` command line).
-2. Open this folder as the PlatformIO project.
-3. Edit the AP name and motor settings at the top of `src/main.cpp` if needed. The access point is open and has no Wi-Fi password.
-4. Build and upload to an ESP32 DevKit board.
-5. Open the serial monitor at 115200 baud. Wait for the certificate generation to finish.
-6. Join the open Wi-Fi network `HandTracker-ESP32`. If your phone asks, stay connected without internet.
-7. Open **https://192.168.4.1:8000** (including `https://`). Accept the local self-signed certificate warning, then tap **Start camera** and allow camera permission.
+Assumes a classic ESP32 DevKit / ESP32-WROOM and two independent A4988 or DRV8825-style STEP/DIR drivers:
 
-The PlatformIO project pins ESP32 Arduino platform 6.6.0 because the HTTPS server's current release uses an ESP-IDF header removed from newer releases. The small compatibility shim is included under `lib/esp32_https_server/src/hwcrypto/sha.h`.
+| ESP32 pin | Connects to |
+|---|---|
+| GPIO 26 | Yaw driver STEP |
+| GPIO 27 | Yaw driver DIR |
+| GPIO 33 | Pitch driver STEP |
+| GPIO 32 | Pitch driver DIR |
+| GPIO 25 | Both driver ENABLE pins (active LOW; optional) |
+| GND | Both driver logic grounds |
 
-The hand model runs in the phone browser. On first start, the page downloads MediaPipe JavaScript and WebAssembly from jsDelivr and an approximately 8 MB model from Google's CDN. The ESP32 does not relay internet; the phone itself must be able to reach those servers (for example, through cellular data while still connected to the ESP32 AP). The page shows which download or initialization stage fails. Camera frames stay on the phone.
+Use a separate motor supply sized for the motors and driver current limit. Connect the ESP32, drivers, and supply grounds together. Never connect a stepper motor directly to ESP32 pins. Verify the driver's input thresholds accept 3.3 V logic.
 
-## Behavior
+Default soft travel limits are ±70° yaw, +35° up, and −25° down. At boot, firmware assumes the turret is centered and the camera is level. It has no encoder, homing routine, or physical limit switches; step counts cannot reveal missed steps. Counterbalance the pitch axis. Keep the mechanism clear, use the web motor toggle deliberately, and do not leave it unattended until homing and hard-limit protection are added.
 
-The horizontal center of the detected hand maps to a pan angle from -60 to +60 degrees. The browser sends only the normalized hand-center position at a limited rate; no camera frames leave the phone. The stepper starts disabled. Use **Enable stepper** to allow movement, adjust the speed limit and hand smoothing sliders, and use **Stop tracking** to stop the camera and disable the driver.
+## Build and use
 
-The ESP32 runs a bounded PID controller with acceleration limiting and a braking-distance speed cap. It uses AccelStepper's emitted-step count as its position estimate. Without a physical encoder, it cannot detect or correct missed motor steps; keep the mechanism within the software angle limits and add homing/feedback hardware if exact physical positioning is required.
+1. Open this folder as a PlatformIO project and install its declared dependencies.
+2. Set `STEPS_PER_REV`, `MICROSTEPS`, gear ratios, direction inversion, and software limits near the top of `src/main.cpp` for the mount.
+3. Flash a classic ESP32 DevKit and open the serial monitor at 115200 baud. Wait for HTTPS certificate generation.
+4. Join `SoccerTurret-ESP32` from the iPhone. If iOS warns there is no internet, stay connected; cellular access may still be used for model downloads.
+5. Open **https://192.168.4.1:8000**, accept the local self-signed certificate warning, and grant camera/microphone permission.
+6. Start the camera/tracker. Enable the motors only after checking the turret is clear. Use STOP to halt and hold the camera; disabling the motors releases holding torque.
 
-This is a pan tracker only; it does not control tilt, distance, or identify a particular person. For reliable direction and repeatable position after power cycling, add a homing switch and calibrate the camera field of view.
+The browser captures at up to 1080p for preview/recording and throttles object detection to about 8 inferences per second. If the first model load fails, check cellular access to jsDelivr and Google; the app shows the failed load stage.
 
-## Adjustments
+## Next engineering steps
 
-In `src/main.cpp`, change `STEP_PIN`, `DIR_PIN`, `ENABLE_PIN`, `STEPS_PER_REV`, `MICROSTEPS`, `GEAR_RATIO`, and `MAX_ANGLE_DEG` for your setup. If the motor moves the wrong way, change `INVERT_DIRECTION`. The page's speed limit and smoothing controls are in `src/tracker_page.h`; PID gains and acceleration are near the top of `src/main.cpp`.
+1. Verify the ESP32 yaw/pitch motion directions and soft limits with the camera unloaded and the assembly centered at boot.
+2. Measure inference rate, ball recall, framing, and clip saving on the actual iPhone at the sideline distance.
+3. Replace or fine-tune the general COCO model with soccer footage labeled for ball and players; add temporal tracking to bridge missed detections.
+4. Add homing switches and a safe pitch counterbalance, then calibrate camera field of view and travel.
+5. If the browser camera/recording path is too limited, move the camera and model to a native iOS app. Apple documents smooth zoom with [`AVCaptureDevice.videoZoomFactor`](https://developer.apple.com/documentation/avfoundation/avcapturedevice/videozoomfactor).
 
-## Browser/model note
+## References
 
-The page uses MediaPipe Hand Landmarker 1.1.0 in VIDEO mode, with GPU delegate first and CPU/WASM fallback. Its frame inference is performed on the phone; it sends only a scalar target to the ESP32. The MediaPipe web guide documents the browser task and model setup: https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker/web_js
+- [MediaPipe Object Detector for Web](https://developers.google.com/edge/mediapipe/solutions/vision/object_detector/web_js)
+- [MediaPipe Object Detector model overview and model benchmarks](https://developers.google.com/edge/mediapipe/solutions/vision/object_detector)
+- [ONNX Runtime Web browser support](https://onnxruntime.ai/docs/get-started/with-javascript/web.html)
+- [Apple AVFoundation camera zoom](https://developer.apple.com/documentation/avfoundation/avcapturedevice/videozoomfactor)

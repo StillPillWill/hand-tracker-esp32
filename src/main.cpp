@@ -10,55 +10,103 @@
 
 using namespace httpsserver;
 
-// Wi-Fi access point
-static const char *AP_SSID = "HandTracker-ESP32";
+// Local, open access point. The phone performs all vision inference.
+static const char *AP_SSID = "SoccerTurret-ESP32";
 
-// STEP/DIR driver wiring for a common ESP32 DevKit
-static constexpr int STEP_PIN = 26;
-static constexpr int DIR_PIN = 27;
-static constexpr int ENABLE_PIN = 25; // Optional, active LOW for A4988/DRV8825
+// One STEP/DIR driver per axis. Both active-low ENABLE inputs may share GPIO 25.
+static constexpr int YAW_STEP_PIN = 26;
+static constexpr int YAW_DIR_PIN = 27;
+static constexpr int PITCH_STEP_PIN = 33;
+static constexpr int PITCH_DIR_PIN = 32;
+static constexpr int ENABLE_PIN = 25;
 static constexpr bool USE_ENABLE_PIN = true;
-static constexpr bool INVERT_DIRECTION = false;
+static constexpr bool INVERT_YAW_DIRECTION = false;
+static constexpr bool INVERT_PITCH_DIRECTION = false;
 
-// Adjust to your motor, microstep jumper setting, and any gearing.
+// Set these for the actual motor, microstep jumpers, and gear ratio.
 static constexpr float STEPS_PER_REV = 200.0f;
 static constexpr float MICROSTEPS = 16.0f;
-static constexpr float GEAR_RATIO = 1.0f;
-static constexpr float MAX_ANGLE_DEG = 60.0f;
-static constexpr float MAX_SPEED_STEPS_S = 900.0f;
-static constexpr float ACCEL_STEPS_S2 = 700.0f;
-static constexpr float STEPS_PER_DEG = (STEPS_PER_REV * MICROSTEPS * GEAR_RATIO) / 360.0f;
-static constexpr long MAX_STEPS = (long)(MAX_ANGLE_DEG * STEPS_PER_DEG);
+static constexpr float YAW_GEAR_RATIO = 1.0f;
+static constexpr float PITCH_GEAR_RATIO = 1.0f;
+static constexpr float YAW_LIMIT_DEG = 70.0f;
+static constexpr float PITCH_UP_LIMIT_DEG = 35.0f;
+static constexpr float PITCH_DOWN_LIMIT_DEG = 25.0f;
+static constexpr float MAX_SPEED_DEG_S = 60.0f;
+static constexpr float ACCEL_DEG_S2 = 90.0f;
+static constexpr float PID_KP = 6.0f;
+static constexpr float PID_KI = 0.03f;
+static constexpr float PID_KD = 0.30f;
+static constexpr float PID_DEADBAND_STEPS = 2.0f;
+static constexpr uint32_t PID_INTERVAL_US = 20000; // 50 Hz per axis
+
+static constexpr float YAW_STEPS_PER_DEG = (STEPS_PER_REV * MICROSTEPS * YAW_GEAR_RATIO) / 360.0f;
+static constexpr float PITCH_STEPS_PER_DEG = (STEPS_PER_REV * MICROSTEPS * PITCH_GEAR_RATIO) / 360.0f;
+static constexpr long YAW_LIMIT_STEPS = (long)(YAW_LIMIT_DEG * YAW_STEPS_PER_DEG);
+static constexpr long PITCH_UP_LIMIT_STEPS = (long)(PITCH_UP_LIMIT_DEG * PITCH_STEPS_PER_DEG);
+static constexpr long PITCH_DOWN_LIMIT_STEPS = (long)(PITCH_DOWN_LIMIT_DEG * PITCH_STEPS_PER_DEG);
 static constexpr float MIN_SPEED_DEG_S = 5.0f;
-static constexpr float MAX_SPEED_DEG_S = MAX_SPEED_STEPS_S / STEPS_PER_DEG;
-static constexpr float DEFAULT_SPEED_DEG_S = 45.0f;
-static constexpr float PID_KP = 6.0f;     // proportional: (steps/s) per step
-static constexpr float PID_KI = 0.03f;    // integral: (steps/s) per step-second
-static constexpr float PID_KD = 0.30f;    // derivative damping against estimated motor speed
-static constexpr uint32_t PID_INTERVAL_US = 20000; // 50 Hz controller; step pulses still run every loop
+static constexpr float MAX_YAW_SPEED_STEPS_S = MAX_SPEED_DEG_S * YAW_STEPS_PER_DEG;
+static constexpr float MAX_PITCH_SPEED_STEPS_S = MAX_SPEED_DEG_S * PITCH_STEPS_PER_DEG;
+
+struct AxisControl {
+  AccelStepper *motor;
+  float stepsPerDegree;
+  long minSteps;
+  long maxSteps;
+  float accelerationStepsPerSecond2;
+  float speedLimitStepsPerSecond;
+  long targetSteps;
+  float speedCommandStepsPerSecond;
+  float integral;
+  long previousPosition;
+  uint32_t lastPidUpdateUs;
+};
+
+AccelStepper yawStepper(AccelStepper::DRIVER, YAW_STEP_PIN, YAW_DIR_PIN);
+AccelStepper pitchStepper(AccelStepper::DRIVER, PITCH_STEP_PIN, PITCH_DIR_PIN);
+AxisControl yawAxis{&yawStepper, YAW_STEPS_PER_DEG, -YAW_LIMIT_STEPS, YAW_LIMIT_STEPS,
+                    ACCEL_DEG_S2 * YAW_STEPS_PER_DEG, 45.0f * YAW_STEPS_PER_DEG,
+                    0, 0.0f, 0.0f, 0, 0};
+AxisControl pitchAxis{&pitchStepper, PITCH_STEPS_PER_DEG, -PITCH_DOWN_LIMIT_STEPS, PITCH_UP_LIMIT_STEPS,
+                      ACCEL_DEG_S2 * PITCH_STEPS_PER_DEG, 30.0f * PITCH_STEPS_PER_DEG,
+                      0, 0.0f, 0.0f, 0, 0};
 
 SSLCert *tlsCert = nullptr;
 HTTPSServer *httpsServer = nullptr;
-AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
-bool motorEnabled = false;
-long targetSteps = 0;
-float speedLimitStepsPerSec = DEFAULT_SPEED_DEG_S * STEPS_PER_DEG;
-float speedCommandStepsPerSec = 0.0f;
-float pidIntegral = 0.0f;
-long previousPidPosition = 0;
-uint32_t lastPidUpdateUs = 0;
+bool motorsEnabled = false;
 
 static float clampFloat(float value, float low, float high) {
   return fmaxf(low, fminf(high, value));
 }
 
-static void disableMotor() {
-  motorEnabled = false;
-  targetSteps = stepper.currentPosition();
-  speedCommandStepsPerSec = 0.0f;
-  pidIntegral = 0.0f;
-  stepper.setSpeed(0.0f);
+static void resetAxis(AxisControl &axis, bool holdCurrentPosition) {
+  const long position = axis.motor->currentPosition();
+  if (holdCurrentPosition) axis.targetSteps = position;
+  axis.speedCommandStepsPerSecond = 0.0f;
+  axis.integral = 0.0f;
+  axis.previousPosition = position;
+  axis.lastPidUpdateUs = micros();
+  axis.motor->setSpeed(0.0f);
+}
+
+static void disableMotors() {
+  motorsEnabled = false;
+  resetAxis(yawAxis, true);
+  resetAxis(pitchAxis, true);
   if (USE_ENABLE_PIN) digitalWrite(ENABLE_PIN, HIGH);
+}
+
+static void stopAndHold() {
+  resetAxis(yawAxis, true);
+  resetAxis(pitchAxis, true);
+  if (motorsEnabled && USE_ENABLE_PIN) digitalWrite(ENABLE_PIN, LOW);
+}
+
+static void setTargetAngles(float yawDegrees, float pitchDegrees) {
+  const long yawTarget = lroundf(yawDegrees * yawAxis.stepsPerDegree);
+  const long pitchTarget = lroundf(pitchDegrees * pitchAxis.stepsPerDegree);
+  yawAxis.targetSteps = constrain(yawTarget, yawAxis.minSteps, yawAxis.maxSteps);
+  pitchAxis.targetSteps = constrain(pitchTarget, pitchAxis.minSteps, pitchAxis.maxSteps);
 }
 
 void handleRoot(HTTPRequest *req, HTTPResponse *res) {
@@ -68,37 +116,40 @@ void handleRoot(HTTPRequest *req, HTTPResponse *res) {
   res->print(TRACKER_HTML);
 }
 
+static bool readNormalizedParameter(ResourceParameters *params, const char *name, float &value) {
+  std::string raw;
+  if (!params->getQueryParameter(name, raw)) return false;
+  char *end = nullptr;
+  value = strtof(raw.c_str(), &end);
+  return end != raw.c_str() && *end == '\0' && isfinite(value) && value >= 0.0f && value <= 1.0f;
+}
+
 void handleTarget(HTTPRequest *req, HTTPResponse *res) {
   req->discardRequestBody();
   ResourceParameters *params = req->getParams();
-  std::string value;
-  if (!params->getQueryParameter("x", value)) {
+  float x = 0.5f, y = 0.5f;
+  if (!readNormalizedParameter(params, "x", x) || !readNormalizedParameter(params, "y", y)) {
     res->setStatusCode(400);
-    res->setStatusText("Missing x");
-    res->setHeader("Content-Type", "text/plain");
-    res->print("Expected normalized x from 0 to 1");
+    res->setStatusText("Invalid target");
+    res->setHeader("Content-Type", "application/json");
+    res->print("{\"ok\":false,\"error\":\"Expected normalized x and y from 0 to 1\"}");
     return;
   }
 
-  char *end = nullptr;
-  const float x = strtof(value.c_str(), &end);
-  if (end == value.c_str() || *end != '\0' || !isfinite(x) || x < 0.0f || x > 1.0f) {
-    res->setStatusCode(400);
-    res->setStatusText("Invalid x");
-    res->setHeader("Content-Type", "text/plain");
-    res->print("x must be from 0 to 1");
-    return;
-  }
-
-  if (!motorEnabled) {
+  if (!motorsEnabled) {
     res->setHeader("Content-Type", "application/json");
     res->print("{\"ok\":false,\"enabled\":false}");
     return;
   }
 
-  // x=0 (left edge) => +MAX angle; x=1 (right edge) => -MAX angle.
-  const float angleDeg = (0.5f - x) * 2.0f * MAX_ANGLE_DEG;
-  targetSteps = constrain(lroundf(angleDeg * STEPS_PER_DEG), -MAX_STEPS, MAX_STEPS);
+  // Image x grows right; image y grows down. Positive yaw pans right and
+  // positive pitch points up. The two physical directions can be inverted above.
+  const float yawDegrees = (x - 0.5f) * 2.0f * YAW_LIMIT_DEG;
+  const float pitchDegrees = y <= 0.5f
+      ? (0.5f - y) * 2.0f * PITCH_UP_LIMIT_DEG
+      : -(y - 0.5f) * 2.0f * PITCH_DOWN_LIMIT_DEG;
+  setTargetAngles(yawDegrees, pitchDegrees);
+
   res->setHeader("Content-Type", "application/json");
   res->print("{\"ok\":true}");
 }
@@ -106,121 +157,133 @@ void handleTarget(HTTPRequest *req, HTTPResponse *res) {
 void handleSettings(HTTPRequest *req, HTTPResponse *res) {
   req->discardRequestBody();
   ResourceParameters *params = req->getParams();
-  std::string enabledValue, speedValue;
+  std::string enabledValue, yawSpeedValue, pitchSpeedValue;
   if (!params->getQueryParameter("enabled", enabledValue) ||
-      !params->getQueryParameter("speed", speedValue) ||
+      !params->getQueryParameter("yawSpeed", yawSpeedValue) ||
+      !params->getQueryParameter("pitchSpeed", pitchSpeedValue) ||
       (enabledValue != "0" && enabledValue != "1")) {
     res->setStatusCode(400);
     res->setStatusText("Invalid settings");
     res->setHeader("Content-Type", "application/json");
-    res->print("{\"ok\":false,\"error\":\"Expected enabled=0|1 and speed in degrees per second\"}");
+    res->print("{\"ok\":false,\"error\":\"Expected enabled=0|1 and yawSpeed/pitchSpeed in degrees per second\"}");
     return;
   }
 
-  char *end = nullptr;
-  const float speedDegPerSec = strtof(speedValue.c_str(), &end);
-  if (end == speedValue.c_str() || *end != '\0' || !isfinite(speedDegPerSec) ||
-      speedDegPerSec < MIN_SPEED_DEG_S || speedDegPerSec > MAX_SPEED_DEG_S) {
+  char *yawEnd = nullptr;
+  char *pitchEnd = nullptr;
+  const float yawSpeedDegPerSec = strtof(yawSpeedValue.c_str(), &yawEnd);
+  const float pitchSpeedDegPerSec = strtof(pitchSpeedValue.c_str(), &pitchEnd);
+  if (yawEnd == yawSpeedValue.c_str() || *yawEnd != '\0' || !isfinite(yawSpeedDegPerSec) ||
+      pitchEnd == pitchSpeedValue.c_str() || *pitchEnd != '\0' || !isfinite(pitchSpeedDegPerSec) ||
+      yawSpeedDegPerSec < MIN_SPEED_DEG_S || yawSpeedDegPerSec > MAX_SPEED_DEG_S ||
+      pitchSpeedDegPerSec < MIN_SPEED_DEG_S || pitchSpeedDegPerSec > MAX_SPEED_DEG_S) {
     res->setStatusCode(400);
     res->setStatusText("Invalid speed");
     res->setHeader("Content-Type", "application/json");
-    res->print("{\"ok\":false,\"error\":\"Speed is outside the supported range\"}");
+    res->print("{\"ok\":false,\"error\":\"Axis speed must be between 5 and 60 degrees per second\"}");
     return;
   }
 
-  speedLimitStepsPerSec = speedDegPerSec * STEPS_PER_DEG;
-  const bool requestedEnabled = enabledValue == "1";
-  if (!requestedEnabled) {
-    disableMotor();
+  yawAxis.speedLimitStepsPerSecond = yawSpeedDegPerSec * yawAxis.stepsPerDegree;
+  pitchAxis.speedLimitStepsPerSecond = pitchSpeedDegPerSec * pitchAxis.stepsPerDegree;
+  if (enabledValue == "0") {
+    disableMotors();
   } else {
-    if (!motorEnabled) {
-      targetSteps = stepper.currentPosition();
-      speedCommandStepsPerSec = 0.0f;
-      pidIntegral = 0.0f;
-      previousPidPosition = stepper.currentPosition();
-      lastPidUpdateUs = micros();
-      motorEnabled = true;
+    if (!motorsEnabled) {
+      resetAxis(yawAxis, true);
+      resetAxis(pitchAxis, true);
+      motorsEnabled = true;
     }
     if (USE_ENABLE_PIN) digitalWrite(ENABLE_PIN, LOW);
   }
 
   res->setHeader("Content-Type", "application/json");
-  res->print(motorEnabled ? "{\"ok\":true,\"enabled\":true}" : "{\"ok\":true,\"enabled\":false}");
+  res->print(motorsEnabled ? "{\"ok\":true,\"enabled\":true}" : "{\"ok\":true,\"enabled\":false}");
 }
 
 void handleStop(HTTPRequest *req, HTTPResponse *res) {
   req->discardRequestBody();
-  disableMotor();
+  // Stop movement but keep holding torque on the pitch axis. Use the motor
+  // toggle to release the drivers when the mount is supported and safe.
+  stopAndHold();
   res->setHeader("Content-Type", "application/json");
-  res->print("{\"ok\":true}");
+  res->print("{\"ok\":true,\"holding\":true}");
 }
 
-void runPidController() {
-  if (!motorEnabled) return;
+static void updateAxis(AxisControl &axis, uint32_t now) {
+  if (!motorsEnabled) return;
 
-  // AccelStepper emits at most one pulse per call, so service it every loop.
-  stepper.runSpeed();
+  // AccelStepper emits at most one step per call. Service both axes every loop.
+  long position = axis.motor->currentPosition();
+  const float currentSpeed = axis.motor->speed();
+  if ((position <= axis.minSteps && currentSpeed < 0.0f) ||
+      (position >= axis.maxSteps && currentSpeed > 0.0f)) {
+    axis.speedCommandStepsPerSecond = 0.0f;
+    axis.motor->setSpeed(0.0f);
+  } else {
+    axis.motor->runSpeed();
+  }
 
-  const uint32_t now = micros();
-  const uint32_t elapsedUs = now - lastPidUpdateUs;
+  const uint32_t elapsedUs = now - axis.lastPidUpdateUs;
   if (elapsedUs < PID_INTERVAL_US) return;
 
   const float dt = elapsedUs * 1.0e-6f;
-  const long position = stepper.currentPosition();
-  const float error = (float)(targetSteps - position);
-  const float measuredSpeed = (position - previousPidPosition) / dt;
-  const float deadbandSteps = 2.0f;
+  position = axis.motor->currentPosition();
+  const float error = (float)(axis.targetSteps - position);
+  const float measuredSpeed = (position - axis.previousPosition) / dt;
   float requestedSpeed = 0.0f;
 
-  if (fabsf(error) > deadbandSteps) {
-    const float integralLimit = speedLimitStepsPerSec / PID_KI;
-    const float candidateIntegral = clampFloat(pidIntegral + error * dt, -integralLimit, integralLimit);
+  if (fabsf(error) > PID_DEADBAND_STEPS) {
+    const float integralLimit = axis.speedLimitStepsPerSecond / PID_KI;
+    const float candidateIntegral = clampFloat(axis.integral + error * dt, -integralLimit, integralLimit);
     const float candidateOutput = PID_KP * error + PID_KI * candidateIntegral - PID_KD * measuredSpeed;
-    const bool windingFurtherHigh = candidateOutput > speedLimitStepsPerSec && error > 0.0f;
-    const bool windingFurtherLow = candidateOutput < -speedLimitStepsPerSec && error < 0.0f;
-    if (!windingFurtherHigh && !windingFurtherLow) pidIntegral = candidateIntegral;
+    const bool windingHigh = candidateOutput > axis.speedLimitStepsPerSecond && error > 0.0f;
+    const bool windingLow = candidateOutput < -axis.speedLimitStepsPerSecond && error < 0.0f;
+    if (!windingHigh && !windingLow) axis.integral = candidateIntegral;
 
-    requestedSpeed = PID_KP * error + PID_KI * pidIntegral - PID_KD * measuredSpeed;
-    // Respect the physical braking distance as well as the user speed limit.
-    const float stoppingSpeed = sqrtf(2.0f * ACCEL_STEPS_S2 * fabsf(error));
-    const float outputLimit = fminf(speedLimitStepsPerSec, stoppingSpeed);
+    requestedSpeed = PID_KP * error + PID_KI * axis.integral - PID_KD * measuredSpeed;
+    const float stoppingSpeed = sqrtf(2.0f * axis.accelerationStepsPerSecond2 * fabsf(error));
+    const float outputLimit = fminf(axis.speedLimitStepsPerSecond, stoppingSpeed);
     requestedSpeed = clampFloat(requestedSpeed, -outputLimit, outputLimit);
   } else {
-    pidIntegral = 0.0f;
+    axis.integral = 0.0f;
   }
 
-  // Slew-limit the PID output to keep motion smooth when the target changes.
-  const float maxSpeedChange = ACCEL_STEPS_S2 * dt;
-  speedCommandStepsPerSec += clampFloat(requestedSpeed - speedCommandStepsPerSec,
-                                        -maxSpeedChange, maxSpeedChange);
-  if (fabsf(speedCommandStepsPerSec) < 0.5f && fabsf(error) <= deadbandSteps) {
-    speedCommandStepsPerSec = 0.0f;
+  const float maxChange = axis.accelerationStepsPerSecond2 * dt;
+  axis.speedCommandStepsPerSecond += clampFloat(requestedSpeed - axis.speedCommandStepsPerSecond,
+                                                -maxChange, maxChange);
+  if (fabsf(axis.speedCommandStepsPerSecond) < 0.5f && fabsf(error) <= PID_DEADBAND_STEPS) {
+    axis.speedCommandStepsPerSecond = 0.0f;
   }
-  stepper.setSpeed(speedCommandStepsPerSec);
-
-  previousPidPosition = position;
-  lastPidUpdateUs = now;
+  axis.motor->setSpeed(axis.speedCommandStepsPerSecond);
+  axis.previousPosition = position;
+  axis.lastPidUpdateUs = now;
 }
 
 void setup() {
   Serial.begin(115200);
   delay(100);
-  pinMode(STEP_PIN, OUTPUT);
-  pinMode(DIR_PIN, OUTPUT);
+  pinMode(YAW_STEP_PIN, OUTPUT);
+  pinMode(YAW_DIR_PIN, OUTPUT);
+  pinMode(PITCH_STEP_PIN, OUTPUT);
+  pinMode(PITCH_DIR_PIN, OUTPUT);
   if (USE_ENABLE_PIN) {
     pinMode(ENABLE_PIN, OUTPUT);
     digitalWrite(ENABLE_PIN, HIGH);
   }
-  stepper.setMaxSpeed(MAX_SPEED_STEPS_S);
-  stepper.setPinsInverted(false, INVERT_DIRECTION, false);
-  stepper.setCurrentPosition(0); // Assumes the assembly starts centered.
-  stepper.setSpeed(0.0f);
-  previousPidPosition = stepper.currentPosition();
-  lastPidUpdateUs = micros();
+
+  yawStepper.setMaxSpeed(MAX_YAW_SPEED_STEPS_S);
+  yawStepper.setPinsInverted(false, INVERT_YAW_DIRECTION, false);
+  yawStepper.setCurrentPosition(0); // Assembly must be mechanically centered at boot.
+  pitchStepper.setMaxSpeed(MAX_PITCH_SPEED_STEPS_S);
+  pitchStepper.setPinsInverted(false, INVERT_PITCH_DIRECTION, false);
+  pitchStepper.setCurrentPosition(0); // Camera must point level at boot.
+  resetAxis(yawAxis, true);
+  resetAxis(pitchAxis, true);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-  if (!WiFi.softAP(AP_SSID)) { // Open access point: no Wi-Fi password
+  if (!WiFi.softAP(AP_SSID)) {
     Serial.println("Could not start Wi-Fi AP");
     while (true) delay(1000);
   }
@@ -229,7 +292,7 @@ void setup() {
   Serial.println("Generating the local HTTPS certificate (first boot can take a while)...");
   tlsCert = new SSLCert();
   const int certResult = createSelfSignedCert(*tlsCert, KEYSIZE_2048,
-      "CN=192.168.4.1,O=ESP32 Hand Tracker", "20261011000000", "20361011000000");
+      "CN=192.168.4.1,O=ESP32 Soccer Turret", "20261011000000", "20361011000000");
   if (certResult != 0) {
     Serial.printf("Certificate generation failed: 0x%02X\n", certResult);
     while (true) delay(1000);
@@ -246,10 +309,14 @@ void setup() {
     while (true) delay(1000);
   }
   Serial.println("Open https://192.168.4.1:8000 on the phone.");
+  Serial.printf("Yaw limits: +/-%.0f deg; pitch limits: +%.0f/-%.0f deg\n",
+                YAW_LIMIT_DEG, PITCH_UP_LIMIT_DEG, PITCH_DOWN_LIMIT_DEG);
 }
 
 void loop() {
   httpsServer->loop();
-  runPidController();
+  const uint32_t now = micros();
+  updateAxis(yawAxis, now);
+  updateAxis(pitchAxis, now);
   delay(1);
 }
