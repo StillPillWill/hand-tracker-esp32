@@ -1,4 +1,5 @@
 .pio/
+/work/
 .vscode/
 .idea/
 .DS_Store

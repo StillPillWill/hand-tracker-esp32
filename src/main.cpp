@@ -102,6 +102,22 @@ static void stopAndHold() {
   if (motorsEnabled && USE_ENABLE_PIN) digitalWrite(ENABLE_PIN, LOW);
 }
 
+static void setTargetFromImage(float x, float y, float zoom) {
+  // Convert image-space displacement into a small, zoom-aware camera angle.
+  // Add that correction to the live motor position so repeated detections
+  // close the visual servo loop instead of mapping pixels to absolute angles.
+  constexpr float HALF_HFOV_RAD = 30.0f * PI / 180.0f;
+  constexpr float HALF_VFOV_RAD = 22.5f * PI / 180.0f;
+  const float yawCorrection = atanf((2.0f * x - 1.0f) * tanf(HALF_HFOV_RAD) / zoom);
+  const float pitchCorrection = atanf((1.0f - 2.0f * y) * tanf(HALF_VFOV_RAD) / zoom);
+  const long yawTarget = yawStepper.currentPosition() +
+      lroundf(yawCorrection * 180.0f / PI * yawAxis.stepsPerDegree);
+  const long pitchTarget = pitchStepper.currentPosition() +
+      lroundf(pitchCorrection * 180.0f / PI * pitchAxis.stepsPerDegree);
+  yawAxis.targetSteps = constrain(yawTarget, yawAxis.minSteps, yawAxis.maxSteps);
+  pitchAxis.targetSteps = constrain(pitchTarget, pitchAxis.minSteps, pitchAxis.maxSteps);
+}
+
 static void setTargetAngles(float yawDegrees, float pitchDegrees) {
   const long yawTarget = lroundf(yawDegrees * yawAxis.stepsPerDegree);
   const long pitchTarget = lroundf(pitchDegrees * pitchAxis.stepsPerDegree);
@@ -135,21 +151,51 @@ void handleTarget(HTTPRequest *req, HTTPResponse *res) {
     res->print("{\"ok\":false,\"error\":\"Expected normalized x and y from 0 to 1\"}");
     return;
   }
-
   if (!motorsEnabled) {
     res->setHeader("Content-Type", "application/json");
     res->print("{\"ok\":false,\"enabled\":false}");
     return;
   }
 
-  // Image x grows right; image y grows down. Positive yaw pans right and
-  // positive pitch points up. The two physical directions can be inverted above.
   const float yawDegrees = (x - 0.5f) * 2.0f * YAW_LIMIT_DEG;
   const float pitchDegrees = y <= 0.5f
       ? (0.5f - y) * 2.0f * PITCH_UP_LIMIT_DEG
       : -(y - 0.5f) * 2.0f * PITCH_DOWN_LIMIT_DEG;
   setTargetAngles(yawDegrees, pitchDegrees);
 
+  res->setHeader("Content-Type", "application/json");
+  res->print("{\"ok\":true}");
+}
+
+void handleAim(HTTPRequest *req, HTTPResponse *res) {
+  req->discardRequestBody();
+  ResourceParameters *params = req->getParams();
+  float x = 0.5f, y = 0.5f, zoom = 1.0f;
+  if (!readNormalizedParameter(params, "x", x) || !readNormalizedParameter(params, "y", y)) {
+    res->setStatusCode(400);
+    res->setStatusText("Invalid target");
+    res->setHeader("Content-Type", "application/json");
+    res->print("{\"ok\":false,\"error\":\"Expected normalized x and y from 0 to 1\"}");
+    return;
+  }
+  std::string zoomValue;
+  if (params->getQueryParameter("z", zoomValue)) {
+    char *end = nullptr;
+    zoom = strtof(zoomValue.c_str(), &end);
+    if (end == zoomValue.c_str() || *end != '\0' || !isfinite(zoom) || zoom < 1.0f || zoom > 12.0f) {
+      res->setStatusCode(400);
+      res->setStatusText("Invalid zoom");
+      res->setHeader("Content-Type", "application/json");
+      res->print("{\"ok\":false,\"error\":\"Zoom must be between 1 and 12\"}");
+      return;
+    }
+  }
+  if (!motorsEnabled) {
+    res->setHeader("Content-Type", "application/json");
+    res->print("{\"ok\":false,\"enabled\":false}");
+    return;
+  }
+  setTargetFromImage(x, y, zoom);
   res->setHeader("Content-Type", "application/json");
   res->print("{\"ok\":true}");
 }
@@ -301,6 +347,7 @@ void setup() {
   httpsServer = new HTTPSServer(tlsCert, 8000, 2);
   httpsServer->registerNode(new ResourceNode("/", "GET", &handleRoot));
   httpsServer->registerNode(new ResourceNode("/target", "GET", &handleTarget));
+  httpsServer->registerNode(new ResourceNode("/aim", "GET", &handleAim));
   httpsServer->registerNode(new ResourceNode("/settings", "POST", &handleSettings));
   httpsServer->registerNode(new ResourceNode("/stop", "POST", &handleStop));
   httpsServer->start();
