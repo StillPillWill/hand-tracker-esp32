@@ -1,0 +1,12 @@
+.pio/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.elf
+*.bin
+*.map
+*.o
+*.d
+*.a
+**/.piopm
