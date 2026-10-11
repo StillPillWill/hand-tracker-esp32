@@ -47,7 +47,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <label class="setting">Track mode
       <select id="trackMode"><option value="play">Focus of play</option><option value="ball">Ball only</option><option value="players">Active player group</option></select>
     </label>
-    <p class="small">Focus of play combines the ball and nearby players when visible. During occlusion it predicts the ball, then uses its fading recent position to score player groups by proximity, movement, convergence, activity, and continuity.</p>
+    <p class="small">Focus of play combines the ball and nearby players when visible. During occlusion it predicts the ball, then uses its fading recent position to score player groups by proximity, movement, convergence, activity, and continuity. Auto-frame keeps a wider field view for an isolated ball or player, then zooms further as it sees a larger active group.</p>
     <label class="setting">Soccer model (.onnx, optional)
       <input id="soccerModelFile" type="file" accept=".onnx,application/octet-stream">
     </label>
@@ -712,6 +712,14 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       return { x: x / totalWeight, y: y / totalWeight };
     }
 
+    function compositionZoomLimit(subjectCount, ballAnchored) {
+      const userLimit = Number(maxZoom.value);
+      const contextLimit = ballAnchored
+        ? subjectCount === 0 ? 1.3 : subjectCount === 1 ? 1.8 : userLimit
+        : subjectCount <= 1 ? 1.5 : subjectCount === 2 ? 2.2 : userLimit;
+      return Math.min(userLimit, contextLimit);
+    }
+
     function calculateFocusOfPlay(ball, predictedBall, players, ballHint = null) {
       const playAnchor = ball || predictedBall;
       if (playAnchor) {
@@ -720,6 +728,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         return {
           target,
           framingSubjects: [playAnchor, ...nearbyPlayers],
+          zoomLimit: compositionZoomLimit(nearbyPlayers.length, true),
           label: ball
             ? `Play focus · ball + ${nearbyPlayers.length} nearby players`
             : `Play focus · predicted ball + ${nearbyPlayers.length} nearby players`
@@ -734,6 +743,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       return {
         target: { x: group.x, y: group.y },
         framingSubjects: group.group,
+        zoomLimit: compositionZoomLimit(group.group.length, false),
         label: `Play focus · ${source}, ${group.group.length} players`
       };
     }
@@ -761,6 +771,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const playHint = predicted || recentBallHint(now);
       let target = null;
       let framingSubjects = [];
+      let focusZoomLimit = Number(maxZoom.value);
       let focusLabel = 'No active play detected';
 
       if (trackMode.value === 'ball' && ball) {
@@ -772,6 +783,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         if (focus) {
           target = focus.target;
           framingSubjects = focus.framingSubjects;
+          focusZoomLimit = focus.zoomLimit;
           focusLabel = focus.label;
         }
       }
@@ -781,6 +793,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         if (group) {
           target = { x: group.x, y: group.y };
           framingSubjects = group.group;
+          focusZoomLimit = compositionZoomLimit(group.group.length, false);
           focusLabel = `Active play · ${group.group.length} players, ${(group.engagement * 100).toFixed(0)}% ball engagement`;
         }
       }
@@ -805,8 +818,8 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         const relativeFit = Math.min(fitHeight, fitWidth);
         const wanted = hardwareZoomActive
           ? clamp(hardwareZoomNow * relativeFit, hardwareZoomRange.min,
-              Math.max(hardwareZoomRange.min, Math.min(hardwareZoomRange.max, Number(maxZoom.value))))
-          : clamp(relativeFit, 1, Number(maxZoom.value));
+              Math.max(hardwareZoomRange.min, Math.min(hardwareZoomRange.max, focusZoomLimit)))
+          : clamp(relativeFit, 1, focusZoomLimit);
         currentZoom += (wanted - currentZoom) * 0.16;
       } else if (!autoZoom.checked) {
         currentZoom = 1;
