@@ -10,6 +10,10 @@ const script = [...page.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]
   .map(match => match[1]).join('\n');
 new vm.Script(script, { filename: 'tracker_page.h inline script' });
 
+test('recording elapsed-time state is declared for the strict module script', () => {
+  assert.match(script, /\blet\b[^;\n]*\brecordingStartedAt\b/);
+});
+
 function extractFunction(name) {
   const starts = [
     script.indexOf(`    function ${name}(`),
@@ -53,6 +57,16 @@ test('iPhone Safari opportunistically tries WebGPU when Safari exposes it', () =
   assert.equal(getBundledSoccerModel(iphone).name, 'phone-float.onnx');
 });
 
+test('iPhone Safari requests an NPU when it exposes WebNN', () => {
+  const { getSoccerProviders, getBundledSoccerModel } = loadLogic();
+  const iphone = {
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Version/26.0 Mobile Safari/605.1.15',
+    platform: 'iPhone', maxTouchPoints: 5, ml: {}, gpu: {}
+  };
+  assert.deepEqual(Array.from(getSoccerProviders(iphone)), ['webnn', 'webgpu', 'wasm']);
+  assert.equal(getBundledSoccerModel(iphone).name, 'phone-float.onnx');
+});
+
 test('iPhone Safari without WebGPU uses the smaller int8 WASM model directly', () => {
   const { getSoccerProviders, getBundledSoccerModel } = loadLogic();
   const iphone = {
@@ -82,7 +96,7 @@ test('supported desktop Chrome keeps WebGPU and the float model', () => {
   assert.equal(getBundledSoccerModel(chrome).name, 'phone-float.onnx');
 });
 
-test('failed WebGPU setup loads cached/downloaded int8 before trying float WASM', async () => {
+test('failed hardware acceleration loads cached/downloaded int8 before trying float WASM', async () => {
   const { getWasmModelCandidates } = loadLogic();
   const floatBytes = new Uint8Array([1, 2]);
   const int8Bytes = new Uint8Array([3, 4]);

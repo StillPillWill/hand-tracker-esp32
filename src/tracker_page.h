@@ -69,7 +69,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <div class="row"><button id="record" class="secondary" disabled>Record match</button><button id="stopRecord" class="secondary" disabled>Stop &amp; save clip</button></div>
     <p class="small">The page requests up to 4K at 30 fps and shows the camera settings the phone actually supplies. When auto-framing can zoom, recording uses a full-resolution crop surface so the saved view follows the play; hardware camera zoom is also applied when available. The crop uses phone camera frames, preserving any stabilization supplied by its camera pipeline; tracking smoothing and motor acceleration limits also ease turret movement. With auto-framing off, it records the camera stream directly. Microphone access is requested only when recording starts.</p>
     <p class="small">Recordings are written to Safari storage in one-second chunks so a full match does not build one huge in-memory video. Keep Safari open in the foreground while recording. After stopping, tap a clip below to save it to Files; delete exported clips here to free phone storage. Long recordings need Safari storage enabled and enough free space.</p>
-    <p class="small">Detection and the selected model stay on the iPhone. Safari 26+ may expose WebGPU; when it does, the page tries ONNX Runtime WebGPU and falls back to multithreaded WebAssembly if setup or warmup fails. WebGPU uses the phone's graphics GPU, not its Neural Engine. Safari does not expose Core ML/Neural Engine directly to this page.</p>
+    <p class="small">Detection and the selected model stay on the iPhone. If the browser exposes WebNN, the page requests its NPU; it also tries WebGPU when available. Unsupported or failed accelerators fall back to the smaller cached int8 soccer model on WebAssembly. Multithreaded WASM is used when browser isolation allows it. WebGPU uses the phone's graphics GPU, not its Neural Engine. Safari may not expose a supported Neural Engine path to a webpage.</p>
     <div id="recordingLibrary" aria-live="polite"></div>
   </div>
 
@@ -132,7 +132,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     let recordingCaptureStream = null, recordingMicStream = null, recordingOutputStream = null;
     let recordingZoomMode = 'camera', lastRecordingFrameAt = 0;
     let recordingWriter = null, recordingFileHandle = null, recordingFolder = null;
-    let recordingWriteQueue = Promise.resolve(), recordingWriteError = null;
+    let recordingWriteQueue = Promise.resolve(), recordingWriteError = null, recordingStartedAt = 0;
     let recordingTimer = 0, recordingWakeLock = null, recordingFileName = '', recordingFinalizePromise = null;
     let recordingStorageInfo = null, recordingStorageAvailable = null, recordingStoragePersisted = false;
     const recordingObjectUrls = new Set();
@@ -687,8 +687,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         || (nav.platform === 'MacIntel' && nav.maxTouchPoints > 1);
       const chromiumBrowser = /(?:Chrome|Chromium|Edg)\//i.test(userAgent);
       const providers = [];
-      // ONNX Runtime Web 1.30 supports WebNN on Chromium for Windows only.
-      if (/Windows NT/i.test(userAgent) && chromiumBrowser && nav.ml) providers.push('webnn');
+      // Probe WebNN only when the browser exposes it. Requesting an NPU can use a
+      // device-specific accelerator when supported; ORT currently lists support
+      // only for Chrome/Edge on Windows, so unsupported probes fall through.
+      if (nav.ml) providers.push('webnn');
       // Restrict the supported WebGPU path to Chromium platforms in the ONNX Runtime matrix.
       const supportedChromiumWebGpu = !iosBrowser && chromiumBrowser
         && /Windows NT|Android|Macintosh|Mac OS X/i.test(userAgent);
@@ -700,9 +702,9 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       return providers;
     }
 
-    async function getWasmModelCandidates(modelBytes, webgpuFailed, loadWasmFallbackModel) {
+    async function getWasmModelCandidates(modelBytes, acceleratorFailed, loadWasmFallbackModel) {
       const candidates = [{ bytes: modelBytes, name: '' }];
-      if (!webgpuFailed || !loadWasmFallbackModel) return { candidates, error: null };
+      if (!acceleratorFailed || !loadWasmFallbackModel) return { candidates, error: null };
       try {
         const fallback = await loadWasmFallbackModel();
         const fallbackBytes = fallback?.bytes instanceof Uint8Array
@@ -725,7 +727,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         ? Math.max(1, Math.min(4, Number(navigator.hardwareConcurrency) || 2))
         : 1;
       let lastError = null;
-      let webgpuFailed = false;
+      let acceleratorFailed = false;
       for (const provider of providers) {
         try {
           status(provider === 'webnn'
@@ -750,10 +752,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
             : provider === 'webgpu' ? ['webgpu', 'wasm'] : ['wasm'];
           let modelCandidates = [{ bytes: modelBytes, name: '' }];
           if (provider === 'wasm') {
-            if (webgpuFailed && loadWasmFallbackModel) {
-              status('WebGPU did not start on this iPhone; loading the smaller WASM soccer model…');
+            if (acceleratorFailed && loadWasmFallbackModel) {
+              status('Hardware acceleration did not start; loading the smaller WASM soccer model…');
             }
-            const selection = await getWasmModelCandidates(modelBytes, webgpuFailed, loadWasmFallbackModel);
+            const selection = await getWasmModelCandidates(modelBytes, acceleratorFailed, loadWasmFallbackModel);
             modelCandidates = selection.candidates;
             if (selection.error) lastError = selection.error;
           }
@@ -777,10 +779,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
               lastError = error;
             }
           }
-          if (provider === 'webgpu') webgpuFailed = true;
+          if (provider === 'webgpu' || provider === 'webnn') acceleratorFailed = true;
         } catch (error) {
           lastError = error;
-          if (provider === 'webgpu') webgpuFailed = true;
+          if (provider === 'webgpu' || provider === 'webnn') acceleratorFailed = true;
         }
       }
       throw new Error(`Could not create the soccer detector. Check cellular access for the ONNX runtime. ${lastError?.message || lastError || ''}`);
@@ -886,7 +888,8 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         const classThresholds = PHONE_VIEW_MODEL_NAMES.has(modelName)
           ? PHONE_VIEW_CLASS_THRESHOLDS : SOCCER_CLASS_THRESHOLDS;
         const loadWasmFallbackModel = modelName === SOCCER_MODEL_NAME
-          && getSoccerProviders().includes('webgpu') ? loadPhoneWasmFallbackModel : null;
+          && getSoccerProviders().some(provider => provider === 'webgpu' || provider === 'webnn')
+            ? loadPhoneWasmFallbackModel : null;
         const soccerDetector = await setupSoccerDetector(modelBytes, classThresholds, loadWasmFallbackModel);
         setSoccerDetector(soccerDetector, soccerDetector.modelName || modelName);
         if (remember) {
