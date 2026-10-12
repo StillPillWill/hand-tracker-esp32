@@ -6,6 +6,7 @@
 #include <HTTPRequest.hpp>
 #include <HTTPResponse.hpp>
 #include <ResourceNode.hpp>
+#include "offline_cache_worker.h"
 #include "tracker_page.h"
 
 using namespace httpsserver;
@@ -145,6 +146,13 @@ void handleStatus(HTTPRequest *req, HTTPResponse *res) {
   res->setHeader("Content-Type", "application/json");
   res->setHeader("Cache-Control", "no-store");
   res->print(statusJson);
+}
+
+void handleOfflineCacheWorker(HTTPRequest *req, HTTPResponse *res) {
+  (void)req;
+  res->setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res->setHeader("Cache-Control", "no-cache");
+  res->print(OFFLINE_CACHE_WORKER);
 }
 
 static bool readNormalizedParameter(ResourceParameters *params, const char *name, float &value) {
@@ -361,6 +369,7 @@ void setup() {
 
   httpsServer = new HTTPSServer(tlsCert, 8000, 2);
   httpsServer->registerNode(new ResourceNode("/", "GET", &handleRoot));
+  httpsServer->registerNode(new ResourceNode("/sw.js", "GET", &handleOfflineCacheWorker));
   httpsServer->registerNode(new ResourceNode("/status", "GET", &handleStatus));
   httpsServer->registerNode(new ResourceNode("/target", "GET", &handleTarget));
   httpsServer->registerNode(new ResourceNode("/aim", "GET", &handleAim));

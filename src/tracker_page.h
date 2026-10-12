@@ -49,7 +49,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     </label>
     <p class="small">Focus of play combines the ball and nearby players when visible. During occlusion it predicts the ball, then uses its fading recent position to score player groups by proximity, movement, convergence, activity, and continuity. Auto-frame keeps a wider field view for an isolated ball or player, then zooms further as it sees a larger active group.</p>
     <div class="row"><button id="loadBundledSoccerModel">Download + load baseline</button><button id="loadMobileSoccerModel" class="secondary">Try phone-view model (experimental)</button><button id="loadSavedSoccerModel" class="secondary" disabled>Load saved model</button><button id="useGenericDetector" class="secondary" disabled>Use general detector</button></div>
-    <p class="small">The baseline is the general soccer model. The experimental phone-view model was adapted using handheld soccer footage; it improved a noisy held-out phone-view sample but scored slightly lower on broadcast footage. Both models download through the phone's internet connection, work offline after loading, and stay on the phone. To use another ONNX model, choose it below.</p>
+    <p class="small">The baseline is the general soccer model. The experimental phone-view model was adapted using handheld soccer footage; it improved a noisy held-out phone-view sample but scored slightly lower on broadcast footage. Models stay on the phone. After the first successful load, Safari caches the model runtime and downloads for offline use when site storage is available; iOS may clear cached site data. To use another ONNX model, choose it below.</p>
     <label class="setting">Use a different soccer model (.onnx)
       <input id="soccerModelFile" type="file" accept=".onnx,application/octet-stream">
     </label>
@@ -114,6 +114,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
 
     let detector = null, detectorKind = 'coco', detectorBusy = false, detectorFailed = false;
     let controllerStateKnown = false;
+    let offlineAssetCachePromise = null, offlineAssetCacheFailed = false;
     let genericDelegate = 'GPU', modelLoading = false;
     let stream = null, running = false, motorsEnabled = false, startToken = 0;
     let frameRequestId = 0, frameRequestKind = 'animation';
@@ -135,6 +136,31 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const recordingObjectUrls = new Set();
     const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
     const status = text => { statusEl.textContent = text; };
+
+    navigator.serviceWorker?.addEventListener('message', event => {
+      if (event.data?.type === 'offline-cache-write-failed') offlineAssetCacheFailed = true;
+    });
+
+    function ensureOfflineAssetCache() {
+      if (!('serviceWorker' in navigator) || !window.isSecureContext) return Promise.resolve(false);
+      if (!offlineAssetCachePromise) {
+        offlineAssetCachePromise = (async () => {
+          await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+          await navigator.serviceWorker.ready;
+          if (!navigator.serviceWorker.controller) {
+            await new Promise(resolve => {
+              const timeout = setTimeout(resolve, 5000);
+              navigator.serviceWorker.addEventListener('controllerchange', () => {
+                clearTimeout(timeout);
+                resolve();
+              }, { once: true });
+            });
+          }
+          return Boolean(navigator.serviceWorker.controller);
+        })().catch(() => false);
+      }
+      return offlineAssetCachePromise;
+    }
 
     function formatBytes(bytes) {
       if (!Number.isFinite(bytes) || bytes < 0) return 'unknown';
@@ -486,6 +512,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     async function setupDetector() {
+      await ensureOfflineAssetCache();
       genericDelegate = 'GPU';
       status('Loading MediaPipe object-detection code…');
       let vision;
@@ -649,6 +676,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     async function setupSoccerDetector(modelBytes) {
+      await ensureOfflineAssetCache();
       modelBytes = modelBytes instanceof Uint8Array ? modelBytes : new Uint8Array(modelBytes);
       if (!modelBytes.byteLength) throw new Error('The selected model file is empty.');
       const providers = [];
@@ -779,6 +807,8 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       loadSoccerModelBtn.disabled = true;
       loadSavedSoccerModelBtn.disabled = true;
       try {
+        offlineAssetCacheFailed = false;
+        const offlineCacheReady = await ensureOfflineAssetCache();
         const modelBytes = await readModelBytes();
         status(`Loading soccer model (${(modelBytes.byteLength / 1048576).toFixed(1)} MB)…`);
         const soccerDetector = await setupSoccerDetector(modelBytes);
@@ -788,10 +818,14 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           try { saved = await saveSoccerModel(modelBytes, modelName); } catch (_) {}
           await refreshSavedSoccerModelButton();
           status(saved
-            ? 'Soccer model loaded and saved on this phone. Start the rear camera to track play.'
+            ? offlineCacheReady && !offlineAssetCacheFailed
+              ? 'Soccer model and runtime loaded and cached on this phone for offline sessions. Start the rear camera to track play.'
+              : 'Soccer model loaded and saved on this phone. Runtime caching could not be confirmed; internet may be needed after reload.'
             : 'Soccer model loaded for this session. Browser storage was unavailable; select the file again after reloading.');
         } else {
-          status('Saved soccer model loaded on the phone. Start the rear camera to track play.');
+          status(offlineCacheReady && !offlineAssetCacheFailed
+            ? 'Saved soccer model and cached runtime loaded on this phone. Start the rear camera to track play.'
+            : 'Saved soccer model loaded. Runtime caching could not be confirmed; internet may be needed after reload.');
         }
       } finally {
         modelLoading = false;
@@ -1543,7 +1577,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         lastRecordingFrameAt = 0;
         drawRecordingFrame(performance.now());
         const types = hasAudio
-          ? ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm']
+          ? ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm']
           : ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
         const mimeType = types.find(type => MediaRecorder.isTypeSupported?.(type));
         const options = { videoBitsPerSecond };
