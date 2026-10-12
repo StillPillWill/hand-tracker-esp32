@@ -42,14 +42,14 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
   <div class="card">
     <h2>Camera and tracking</h2>
     <div class="row"><button id="start">Start camera + tracker</button><button id="stop" class="secondary" disabled>Stop camera</button></div>
-    <p id="status">Ready. Load the baseline or experimental phone-view soccer model.</p>
+    <p id="status">Ready. Load the phone-view soccer model or the general soccer baseline.</p>
     <span class="pill" id="trackingState">No camera</span><span class="pill" id="targetReadout">Aim: center</span><span class="pill" id="zoomReadout">Zoom: 1.0×</span><span class="pill" id="cameraReadout">Camera: not started</span><span class="pill" id="inferenceReadout">Inference: —</span>
     <label class="setting">Track mode
       <select id="trackMode"><option value="play">Focus of play</option><option value="ball">Ball only</option><option value="players">Active player group</option></select>
     </label>
     <p class="small">Focus of play combines the ball and nearby players when visible. During occlusion it predicts the ball, then uses its fading recent position to score player groups by proximity, movement, convergence, activity, and continuity. Auto-frame keeps a wider field view for an isolated ball or player, then zooms further as it sees a larger active group.</p>
-    <div class="row"><button id="loadBundledSoccerModel">Download + load baseline</button><button id="loadMobileSoccerModel" class="secondary">Try phone-view model (experimental)</button><button id="loadSavedSoccerModel" class="secondary" disabled>Load saved model</button><button id="useGenericDetector" class="secondary" disabled>Use general detector</button></div>
-    <p class="small">The baseline is the general soccer model. The experimental phone-view model was adapted using handheld soccer footage; it improved a noisy held-out phone-view sample but scored slightly lower on broadcast footage. Models stay on the phone. After the first successful load, Safari caches the model runtime and downloads for offline use when site storage is available; iOS may clear cached site data. To use another ONNX model, choose it below.</p>
+    <div class="row"><button id="loadBundledSoccerModel">Download + load phone-view model</button><button id="loadBaselineSoccerModel" class="secondary">Load general soccer baseline</button><button id="loadSavedSoccerModel" class="secondary" disabled>Load saved model</button><button id="useGenericDetector" class="secondary" disabled>Use general detector</button></div>
+    <p class="small">The default phone-view model was adapted using handheld soccer footage and improves ball and player detection on held-out phone-view samples with machine-generated labels. The general soccer baseline remains available for broadcast-style footage. Models stay on the phone. After the first successful load, Safari caches the model runtime and downloads for offline sessions when site storage is available; iOS may clear cached site data. To use another ONNX model, choose it below.</p>
     <label class="setting">Use a different soccer model (.onnx)
       <input id="soccerModelFile" type="file" accept=".onnx,application/octet-stream">
     </label>
@@ -101,7 +101,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const trackMode = document.querySelector('#trackMode');
     const soccerModelFile = document.querySelector('#soccerModelFile');
     const loadBundledSoccerModelBtn = document.querySelector('#loadBundledSoccerModel');
-    const loadMobileSoccerModelBtn = document.querySelector('#loadMobileSoccerModel');
+    const loadBaselineSoccerModelBtn = document.querySelector('#loadBaselineSoccerModel');
     const loadSoccerModelBtn = document.querySelector('#loadSoccerModel');
     const loadSavedSoccerModelBtn = document.querySelector('#loadSavedSoccerModel');
     const useGenericDetectorBtn = document.querySelector('#useGenericDetector');
@@ -552,15 +552,16 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
 
     const ORT_VERSION = '1.30.0';
     const ORT_DIST = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
-    const SOCCER_MODEL_URL = 'https://raw.githubusercontent.com/StillPillWill/hand-tracker-esp32/soccer-camera-turret/model/soccer-yolo11n-1280.onnx';
-    const MOBILE_SOCCER_MODEL_URL = 'https://raw.githubusercontent.com/StillPillWill/hand-tracker-esp32/soccer-camera-turret/model/soccer-yolo11n-1280-mobile.onnx';
-    const SOCCER_MODEL_NAME = 'soccer-yolo11n-1280.onnx';
-    const MOBILE_SOCCER_MODEL_NAME = 'soccer-yolo11n-1280-mobile.onnx';
+    const SOCCER_MODEL_URL = 'https://raw.githubusercontent.com/StillPillWill/hand-tracker-esp32/soccer-camera-turret/model/soccer-yolo11n-1280-mobile.onnx';
+    const BASELINE_SOCCER_MODEL_URL = 'https://raw.githubusercontent.com/StillPillWill/hand-tracker-esp32/soccer-camera-turret/model/soccer-yolo11n-1280.onnx';
+    const SOCCER_MODEL_NAME = 'soccer-yolo11n-1280-mobile.onnx';
+    const BASELINE_SOCCER_MODEL_NAME = 'soccer-yolo11n-1280.onnx';
     const SOCCER_INPUT_SIZE = 1280;
     const SOCCER_CLASS_NAMES = ['ball', 'player', 'referee'];
     const SOCCER_CLASS_THRESHOLDS = [0.12, 0.18, 0.18];
+    const PHONE_VIEW_CLASS_THRESHOLDS = [0.18, 0.18, 0.18];
 
-    function createSoccerOrtDetector(ort, session, provider, wasmThreads) {
+    function createSoccerOrtDetector(ort, session, provider, wasmThreads, classThresholds) {
       const inputName = session.inputNames[0];
       const outputName = session.outputNames[0];
       const inputSize = SOCCER_INPUT_SIZE;
@@ -603,7 +604,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
             const score = at(4 + classIndex, index);
             if (score > confidence) { confidence = score; classId = classIndex; }
           }
-          if (classId < 0 || confidence < SOCCER_CLASS_THRESHOLDS[classId]) continue;
+          if (classId < 0 || confidence < classThresholds[classId]) continue;
           const centerX = at(0, index);
           const centerY = at(1, index);
           const width = at(2, index);
@@ -677,7 +678,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       };
     }
 
-    async function setupSoccerDetector(modelBytes) {
+    async function setupSoccerDetector(modelBytes, classThresholds) {
       await ensureOfflineAssetCache();
       modelBytes = modelBytes instanceof Uint8Array ? modelBytes : new Uint8Array(modelBytes);
       if (!modelBytes.byteLength) throw new Error('The selected model file is empty.');
@@ -712,7 +713,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           });
           let detector = null;
           try {
-            detector = createSoccerOrtDetector(ort, session, provider, wasmThreads);
+            detector = createSoccerOrtDetector(ort, session, provider, wasmThreads, classThresholds);
             status(provider === 'webnn' ? 'Preparing the soccer model on WebNN NPU…'
               : provider === 'webgpu' ? 'Preparing the soccer model on WebGPU…' : 'Preparing the soccer model on WASM…');
             await detector.warmup();
@@ -806,7 +807,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       modelLoading = true;
       startBtn.disabled = true;
       loadBundledSoccerModelBtn.disabled = true;
-      loadMobileSoccerModelBtn.disabled = true;
+      loadBaselineSoccerModelBtn.disabled = true;
       soccerModelFile.disabled = true;
       loadSoccerModelBtn.disabled = true;
       loadSavedSoccerModelBtn.disabled = true;
@@ -815,7 +816,9 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         const offlineCacheReady = await ensureOfflineAssetCache();
         const modelBytes = await readModelBytes();
         status(`Loading soccer model (${(modelBytes.byteLength / 1048576).toFixed(1)} MB)…`);
-        const soccerDetector = await setupSoccerDetector(modelBytes);
+        const classThresholds = modelName === SOCCER_MODEL_NAME
+          ? PHONE_VIEW_CLASS_THRESHOLDS : SOCCER_CLASS_THRESHOLDS;
+        const soccerDetector = await setupSoccerDetector(modelBytes, classThresholds);
         setSoccerDetector(soccerDetector, modelName);
         if (remember) {
           let saved = false;
@@ -835,7 +838,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         modelLoading = false;
         startBtn.disabled = running;
         loadBundledSoccerModelBtn.disabled = running;
-        loadMobileSoccerModelBtn.disabled = running;
+        loadBaselineSoccerModelBtn.disabled = running;
         soccerModelFile.disabled = running;
         loadSoccerModelBtn.disabled = running || !soccerModelFile.files?.length;
         await refreshSavedSoccerModelButton();
@@ -849,11 +852,11 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     async function downloadBundledSoccerModel() {
-      return downloadSoccerModel(SOCCER_MODEL_URL, SOCCER_MODEL_NAME, 'baseline');
+      return downloadSoccerModel(SOCCER_MODEL_URL, SOCCER_MODEL_NAME, 'phone-view');
     }
 
-    async function downloadMobileSoccerModel() {
-      return downloadSoccerModel(MOBILE_SOCCER_MODEL_URL, MOBILE_SOCCER_MODEL_NAME, 'experimental phone-view');
+    async function downloadBaselineSoccerModel() {
+      return downloadSoccerModel(BASELINE_SOCCER_MODEL_URL, BASELINE_SOCCER_MODEL_NAME, 'general soccer baseline');
     }
 
     async function downloadSoccerModel(modelUrl, modelName, modelLabel) {
@@ -1341,7 +1344,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const request = ++startToken;
       startBtn.disabled = true;
       loadBundledSoccerModelBtn.disabled = true;
-      loadMobileSoccerModelBtn.disabled = true;
+      loadBaselineSoccerModelBtn.disabled = true;
       soccerModelFile.disabled = true;
       loadSoccerModelBtn.disabled = true;
       loadSavedSoccerModelBtn.disabled = true;
@@ -1396,7 +1399,9 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           if (saved?.bytes) {
             status('Loading the saved soccer model from this phone…');
             try {
-              const savedDetector = await setupSoccerDetector(new Uint8Array(saved.bytes));
+              const savedThresholds = saved.name === SOCCER_MODEL_NAME
+                ? PHONE_VIEW_CLASS_THRESHOLDS : SOCCER_CLASS_THRESHOLDS;
+              const savedDetector = await setupSoccerDetector(new Uint8Array(saved.bytes), savedThresholds);
               if (request !== startToken) { savedDetector.close?.(); return; }
               setSoccerDetector(savedDetector, saved.name || 'saved model');
             } catch (error) {
@@ -1428,7 +1433,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         startBtn.textContent = detector ? 'Retry' : stream ? 'Retry tracker' : 'Start camera + tracker';
         startBtn.disabled = false;
         loadBundledSoccerModelBtn.disabled = false;
-        loadMobileSoccerModelBtn.disabled = false;
+        loadBaselineSoccerModelBtn.disabled = false;
         soccerModelFile.disabled = false;
         loadSoccerModelBtn.disabled = !soccerModelFile.files?.length;
         await refreshSavedSoccerModelButton();
@@ -1507,7 +1512,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       recordBtn.disabled = true; stopBtn.disabled = true;
       startBtn.disabled = false; startBtn.textContent = 'Start camera + tracker';
       loadBundledSoccerModelBtn.disabled = false;
-      loadMobileSoccerModelBtn.disabled = false;
+      loadBaselineSoccerModelBtn.disabled = false;
       soccerModelFile.disabled = false;
       loadSoccerModelBtn.disabled = !soccerModelFile.files?.length;
       await refreshSavedSoccerModelButton();
@@ -1530,10 +1535,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     startBtn.addEventListener('click', startCameraAndTracking);
     stopBtn.addEventListener('click', stopCamera);
     loadBundledSoccerModelBtn.addEventListener('click', () => {
-      downloadBundledSoccerModel().catch(error => status(`Included soccer model failed: ${error?.message || error}`));
+      downloadBundledSoccerModel().catch(error => status(`Phone-view soccer model failed: ${error?.message || error}`));
     });
-    loadMobileSoccerModelBtn.addEventListener('click', () => {
-      downloadMobileSoccerModel().catch(error => status(`Phone-view soccer model failed: ${error?.message || error}`));
+    loadBaselineSoccerModelBtn.addEventListener('click', () => {
+      downloadBaselineSoccerModel().catch(error => status(`General soccer baseline failed: ${error?.message || error}`));
     });
     loadSavedSoccerModelBtn.addEventListener('click', () => {
       loadSavedSoccerModel().catch(error => status(`Saved soccer model failed: ${error?.message || error}`));
