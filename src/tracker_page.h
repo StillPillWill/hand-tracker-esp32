@@ -13,7 +13,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     h1{font-size:1.5rem;margin:0 0 5px}.sub,.small{color:#aab6d1}.sub{margin:0 0 14px}.small{font-size:.88rem;line-height:1.4}.card{background:#182235;border:1px solid #34415c;border-radius:16px;padding:14px;margin:12px 0}
     h2{font-size:1rem;margin:0 0 12px}.row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.row>*{flex:1 1 130px}button,select{border:0;border-radius:10px;padding:12px 14px;font-size:.98rem;font-weight:650;background:#819cff;color:#091222}button.stop{background:#ff6d7e}button.enabled{background:#75d99a}button.secondary{background:#34435e;color:#eef2ff}button:disabled{opacity:.5}
     #status{min-height:1.4em;color:#d5def7;margin:10px 0}.pill{display:inline-block;padding:4px 9px;border:1px solid #52617f;border-radius:999px;margin:3px 5px 3px 0;font-size:.83rem}.setting{display:block;margin:13px 0;color:#eef2ff}.setting input{display:block;width:100%;margin-top:7px;accent-color:#819cff}.readout{color:#aab6d1;font-variant-numeric:tabular-nums}.check{display:flex;gap:9px;align-items:center;margin:12px 0}.check input{accent-color:#819cff;width:20px;height:20px}
-    #stage{position:relative;overflow:hidden;background:#05080d;border-radius:12px;aspect-ratio:16/9}canvas{display:block;width:100%;height:100%;object-fit:contain}.overlay{position:absolute;inset:0;pointer-events:none}.manual{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-width:360px;margin:auto}.manual button{padding:8px}.spacer{visibility:hidden}a.clip{color:#9eb5ff;word-break:break-all}.hint{margin-bottom:0}
+    #stage{position:relative;overflow:hidden;background:#05080d;border-radius:12px;aspect-ratio:16/9}canvas{display:block;width:100%;height:100%;object-fit:contain}.overlay{position:absolute;inset:0;pointer-events:none}.manual{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-width:360px;margin:auto}.manual button{padding:8px}.spacer{visibility:hidden}.recordingRow{display:flex;gap:8px;align-items:center;margin:8px 0}.recordingRow a{flex:1;min-width:0;color:#9eb5ff;word-break:break-all}.recordingRow button{flex:0 0 auto}.hint{margin-bottom:0}
   </style>
 </head>
 <body>
@@ -62,10 +62,15 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       <input id="smoothing" type="range" min="0" max="90" step="1" value="65">
     </label>
     <label class="check"><input id="autoZoom" type="checkbox" checked><span>Auto-frame the detected play</span></label>
-    <div class="row"><button id="record" class="secondary" disabled>Record clip</button><button id="stopRecord" class="secondary" disabled>Stop &amp; save clip</button></div>
-    <p class="small">The page requests up to 4K at 30 fps and shows the camera settings the phone actually supplies. When auto-framing can zoom, recording uses a full-resolution crop surface so the saved view follows the play; hardware camera zoom is also applied when available. The crop uses phone camera frames, preserving any stabilization supplied by its camera pipeline; tracking smoothing and motor acceleration limits also ease turret motion. With auto-framing off, it records the camera stream directly. Microphone access is requested only when recording starts.</p>
+    <label class="setting">Recording time limit: <span id="recordMinutesReadout" class="readout">120 min</span>
+      <input id="recordMinutes" type="range" min="15" max="180" step="15" value="120">
+    </label>
+    <p id="recordStorageReadout" class="small">Checking Safari storage…</p>
+    <div class="row"><button id="record" class="secondary" disabled>Record match</button><button id="stopRecord" class="secondary" disabled>Stop &amp; save clip</button></div>
+    <p class="small">The page requests up to 4K at 30 fps and shows the camera settings the phone actually supplies. When auto-framing can zoom, recording uses a full-resolution crop surface so the saved view follows the play; hardware camera zoom is also applied when available. The crop uses phone camera frames, preserving any stabilization supplied by its camera pipeline; tracking smoothing and motor acceleration limits also ease turret movement. With auto-framing off, it records the camera stream directly. Microphone access is requested only when recording starts.</p>
+    <p class="small">Recordings are written to Safari storage in one-second chunks so a full match does not build one huge in-memory video. Keep Safari open in the foreground while recording. After stopping, tap a clip below to save it to Files; delete exported clips here to free phone storage. Long recordings need Safari storage enabled and enough free space.</p>
     <p class="small">Detection and the selected model stay on the iPhone. The custom soccer model requests WebNN/NPU when exposed by the browser, then tries WebGPU and WebAssembly. Safari does not expose a direct Core ML/Neural Engine path to this page; WebGPU uses the phone GPU, not its Neural Engine.</p>
-    <a id="lastClip" class="clip" hidden></a>
+    <div id="recordingLibrary" aria-live="polite"></div>
   </div>
 
   <div class="card"><div id="stage"><canvas id="canvas"></canvas></div>
@@ -101,7 +106,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const detectorReadout = document.querySelector('#detectorReadout');
     const recordBtn = document.querySelector('#record');
     const stopRecordBtn = document.querySelector('#stopRecord');
-    const lastClip = document.querySelector('#lastClip');
+    const recordMinutes = document.querySelector('#recordMinutes');
+    const recordMinutesReadout = document.querySelector('#recordMinutesReadout');
+    const recordStorageReadout = document.querySelector('#recordStorageReadout');
+    const recordingLibrary = document.querySelector('#recordingLibrary');
 
     let detector = null, detectorKind = 'coco', detectorBusy = false, detectorFailed = false;
     let genericDelegate = 'GPU', modelLoading = false;
@@ -117,8 +125,212 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     let recordingCanvas = null, recordingCanvasContext = null;
     let recordingCaptureStream = null, recordingMicStream = null, recordingOutputStream = null;
     let recordingZoomMode = 'camera', lastRecordingFrameAt = 0;
+    let recordingWriter = null, recordingFileHandle = null, recordingFolder = null;
+    let recordingWriteQueue = Promise.resolve(), recordingWriteError = null;
+    let recordingTimer = 0, recordingWakeLock = null, recordingFileName = '', recordingFinalizePromise = null;
+    let recordingStorageInfo = null, recordingStorageAvailable = null, recordingStoragePersisted = false;
+    const recordingObjectUrls = new Set();
     const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
     const status = text => { statusEl.textContent = text; };
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes) || bytes < 0) return 'unknown';
+      if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
+      return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+    }
+
+    function plannedRecordingBitrate() {
+      if (!videoTrack) return 50000000;
+      const settings = videoTrack?.getSettings ? videoTrack.getSettings() : {};
+      return settings.width >= 3840 ? 50000000 : settings.width >= 1920 ? 24000000 : 12000000;
+    }
+
+    function updateRecordingPlan() {
+      const minutes = Number(recordMinutes.value);
+      recordMinutesReadout.textContent = `${minutes} min`;
+      if (recordingStorageAvailable === false || !navigator.storage?.getDirectory) {
+        recordStorageReadout.textContent = 'This Safari session does not expose local recording storage. Long match recording is unavailable; leave Private Browsing and reload.';
+        return;
+      }
+      const bitrate = plannedRecordingBitrate();
+      const expectedBytes = bitrate * minutes * 60 / 8;
+      const freeBytes = recordingStorageInfo?.quota - recordingStorageInfo?.usage;
+      const free = Number.isFinite(freeBytes) ? `${formatBytes(freeBytes)} available` : 'free space not reported';
+      const quality = `${Math.round(bitrate / 1000000)} Mbps requested`;
+      recordStorageReadout.textContent = `Safari storage: ${free} · estimated ${formatBytes(expectedBytes)} for ${minutes} min at ${quality}, before audio and overhead.`;
+    }
+
+    async function refreshRecordingStorageInfo() {
+      recordingStorageInfo = null;
+      recordingStorageAvailable = Boolean(navigator.storage?.getDirectory);
+      if (!recordingStorageAvailable) {
+        updateRecordingPlan();
+        return;
+      }
+      try {
+        await navigator.storage.getDirectory();
+        if (navigator.storage?.estimate) recordingStorageInfo = await navigator.storage.estimate();
+      } catch (_) {
+        recordingStorageAvailable = false;
+      }
+      updateRecordingPlan();
+    }
+
+    function createRecordingWriter() {
+      const workerSource = `
+        let access = null, offset = 0, queue = Promise.resolve();
+        self.onmessage = event => {
+          const message = event.data;
+          queue = queue.then(async () => {
+            if (message.type === 'open') {
+              access = await message.fileHandle.createSyncAccessHandle();
+              access.truncate(0);
+              offset = 0;
+              self.postMessage({ type: 'ready', id: message.id });
+            } else if (message.type === 'chunk') {
+              if (!access) throw new Error('Recording storage is not open.');
+              const bytes = new Uint8Array(await message.blob.arrayBuffer());
+              let written = 0;
+              while (written < bytes.length) {
+                const count = access.write(bytes.subarray(written), { at: offset + written });
+                if (!count) throw new Error('Safari could not write a video chunk to local storage.');
+                written += count;
+              }
+              offset += written;
+              access.flush();
+              self.postMessage({ type: 'written', id: message.id, total: offset });
+            } else if (message.type === 'close') {
+              if (access) { access.flush(); access.close(); access = null; }
+              self.postMessage({ type: 'closed', id: message.id, total: offset });
+            }
+          }).catch(error => {
+            self.postMessage({ type: 'error', id: message.id, error: error && error.message ? error.message : String(error) });
+          });
+        };
+      `;
+      const workerUrl = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
+      const worker = new Worker(workerUrl);
+      const pending = new Map();
+      let nextId = 0;
+      const rejectPending = error => {
+        for (const request of pending.values()) request.reject(error);
+        pending.clear();
+      };
+      worker.onmessage = event => {
+        const message = event.data;
+        const request = pending.get(message.id);
+        if (!request) return;
+        pending.delete(message.id);
+        if (message.type === 'error') request.reject(new Error(message.error));
+        else request.resolve(message);
+      };
+      worker.onerror = event => rejectPending(new Error(event.message || 'Recording storage worker failed.'));
+      return {
+        request(type, payload = {}) {
+          return new Promise((resolve, reject) => {
+            const id = ++nextId;
+            pending.set(id, { resolve, reject });
+            try { worker.postMessage({ type, id, ...payload }); }
+            catch (error) { pending.delete(id); reject(error); }
+          });
+        },
+        dispose() {
+          worker.terminate();
+          URL.revokeObjectURL(workerUrl);
+          rejectPending(new Error('Recording storage worker closed.'));
+        }
+      };
+    }
+
+    async function openRecordingStorage(name, bitrate, minutes) {
+      if (!navigator.storage?.getDirectory) {
+        throw new Error('Long match recording needs Safari local storage. Exit Private Browsing and reload this page.');
+      }
+      let estimate = null;
+      try { estimate = await navigator.storage.estimate?.(); } catch (_) {}
+      const freeBytes = estimate && Number.isFinite(estimate.quota) && Number.isFinite(estimate.usage)
+        ? Math.max(0, estimate.quota - estimate.usage) : null;
+      const expectedBytes = bitrate * minutes * 60 / 8;
+      if (freeBytes != null && freeBytes < expectedBytes * 1.12) {
+        throw new Error(`Safari reports ${formatBytes(freeBytes)} free; this recording may need about ${formatBytes(expectedBytes)}. Free phone storage or choose a shorter limit.`);
+      }
+      try { recordingStoragePersisted = Boolean(await navigator.storage.persist?.()); } catch (_) {
+        recordingStoragePersisted = false;
+      }
+      const root = await navigator.storage.getDirectory();
+      const folder = await root.getDirectoryHandle('soccer-recordings', { create: true });
+      const fileHandle = await folder.getFileHandle(name, { create: true });
+      const writer = createRecordingWriter();
+      try {
+        await writer.request('open', { fileHandle });
+      } catch (error) {
+        writer.dispose();
+        await folder.removeEntry(name).catch(() => {});
+        throw new Error(`Could not open Safari recording storage: ${error?.message || error}`);
+      }
+      recordingFolder = folder;
+      recordingFileHandle = fileHandle;
+      recordingFileName = name;
+      recordingWriter = writer;
+      recordingWriteQueue = Promise.resolve();
+      recordingWriteError = null;
+    }
+
+    async function refreshRecordingLibrary() {
+      for (const url of recordingObjectUrls) URL.revokeObjectURL(url);
+      recordingObjectUrls.clear();
+      recordingLibrary.replaceChildren();
+      if (!navigator.storage?.getDirectory) {
+        recordingLibrary.textContent = 'Saved recordings require Safari local storage.';
+        return;
+      }
+      try {
+        const root = await navigator.storage.getDirectory();
+        const folder = await root.getDirectoryHandle('soccer-recordings', { create: true });
+        const clips = [];
+        for await (const [name, handle] of folder.entries()) {
+          if (handle.kind !== 'file' || (!name.endsWith('.mp4') && !name.endsWith('.webm'))) continue;
+          const file = await handle.getFile();
+          if (file.size) clips.push({ name, file });
+        }
+        clips.sort((a, b) => b.name.localeCompare(a.name));
+        if (!clips.length) {
+          recordingLibrary.textContent = 'No saved recordings yet.';
+          return;
+        }
+        for (const clip of clips) {
+          const row = document.createElement('div');
+          row.className = 'recordingRow';
+          const link = document.createElement('a');
+          link.href = URL.createObjectURL(clip.file);
+          recordingObjectUrls.add(link.href);
+          link.download = clip.name;
+          link.textContent = `Save ${clip.name} to Files (${formatBytes(clip.file.size)})`;
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.className = 'secondary';
+          remove.textContent = 'Delete';
+          remove.addEventListener('click', async () => {
+            remove.disabled = true;
+            try {
+              await folder.removeEntry(clip.name);
+              status(`Deleted ${clip.name} from Safari storage.`);
+              await refreshRecordingStorageInfo();
+              await refreshRecordingLibrary();
+            } catch (error) {
+              remove.disabled = false;
+              status(`Could not delete the saved clip: ${error?.message || error}`);
+            }
+          });
+          row.append(link, remove);
+          recordingLibrary.append(row);
+        }
+      } catch (error) {
+        recordingStorageAvailable = false;
+        updateRecordingPlan();
+        recordingLibrary.textContent = `Could not read saved recordings: ${error?.message || error}`;
+      }
+    }
 
     function setMotorUi() {
       motorBtn.textContent = motorsEnabled ? 'Disable motors' : 'Enable motors';
@@ -187,6 +399,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     function updateCameraReadout() {
       if (!videoTrack) {
         cameraReadout.textContent = 'Camera: not started';
+        updateRecordingPlan();
         return;
       }
       const settings = videoTrack.getSettings ? videoTrack.getSettings() : {};
@@ -197,6 +410,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       cameraReadout.textContent = width && height
         ? `Camera: ${width}×${height}${fps}${zoom}`
         : 'Camera: reading settings…';
+      updateRecordingPlan();
     }
 
     async function applyHardwareZoom() {
@@ -1056,33 +1270,59 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     function stopAndSaveRecording() {
+      if (recordingFinalizePromise) return recordingFinalizePromise;
       if (!recorder || recorder.state === 'inactive') return Promise.resolve();
       stopRecordBtn.disabled = true;
-      return new Promise(resolve => {
-        recorder.onstop = () => {
-          const type = recorder.mimeType || 'video/mp4';
-          const blob = new Blob(recordingChunks, { type });
-          recordingChunks = [];
-          if (lastClip.href.startsWith('blob:')) URL.revokeObjectURL(lastClip.href);
-          const extension = type.includes('webm') ? 'webm' : 'mp4';
-          const name = `soccer-turret-${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`;
-          lastClip.href = URL.createObjectURL(blob);
-          lastClip.download = name;
-          lastClip.textContent = `Download recorded clip (${(blob.size / 1048576).toFixed(1)} MB)`;
-          lastClip.hidden = false;
-          lastClip.click();
-          status('Clip recorded. If it did not save automatically, tap the download link below.');
-          recorder = null;
-          recordingCaptureStream?.getTracks().forEach(track => track.stop());
-          recordingMicStream?.getTracks().forEach(track => track.stop());
-          recordingCaptureStream = null; recordingMicStream = null; recordingOutputStream = null;
-          recordingCanvasContext = null; recordingCanvas = null; recordingZoomMode = 'camera';
-          autoZoom.disabled = false; maxZoom.disabled = false;
-          recordBtn.disabled = false;
-          resolve();
+      const activeRecorder = recorder;
+      recordingFinalizePromise = new Promise(resolve => {
+        activeRecorder.onstop = async () => {
+          clearTimeout(recordingTimer);
+          recordingTimer = 0;
+          try {
+            await recordingWriteQueue;
+            if (recordingWriteError) throw recordingWriteError;
+            if (!recordingWriter || !recordingFileHandle) throw new Error('Recording storage closed before the clip was finalized.');
+            await recordingWriter.request('close');
+            recordingWriter.dispose();
+            recordingWriter = null;
+            const file = await recordingFileHandle.getFile();
+            if (!file.size) throw new Error('The recording file is empty.');
+            await refreshRecordingLibrary();
+            await refreshRecordingStorageInfo();
+            status(`Clip ready in Safari storage (${formatBytes(file.size)}). Tap its link below to save it to Files.`);
+          } catch (error) {
+            recordingWriter?.dispose();
+            recordingWriter = null;
+            if (recordingFolder && recordingFileName) await recordingFolder.removeEntry(recordingFileName).catch(() => {});
+            status(`Could not finish recording: ${error?.message || error}`);
+          } finally {
+            recordingChunks = [];
+            recorder = null;
+            recordingFileHandle = null; recordingFolder = null; recordingFileName = '';
+            recordingCaptureStream?.getTracks().forEach(track => track.stop());
+            recordingMicStream?.getTracks().forEach(track => track.stop());
+            recordingCaptureStream = null; recordingMicStream = null; recordingOutputStream = null;
+            recordingCanvasContext = null; recordingCanvas = null; recordingZoomMode = 'camera';
+            autoZoom.disabled = false; maxZoom.disabled = false; recordMinutes.disabled = false;
+            recordBtn.disabled = !running;
+            stopRecordBtn.disabled = true;
+            if (recordingWakeLock) {
+              const wakeLock = recordingWakeLock;
+              recordingWakeLock = null;
+              try { await wakeLock.release(); } catch (_) {}
+            }
+            recordingFinalizePromise = null;
+            resolve();
+          }
         };
-        recorder.stop();
+        try { activeRecorder.stop(); }
+        catch (error) {
+          recordingWriteError = error;
+          status(`Could not stop recording cleanly: ${error?.message || error}`);
+          activeRecorder.onstop?.();
+        }
       });
+      return recordingFinalizePromise;
     }
 
     async function stopCamera() {
@@ -1152,6 +1392,9 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       recordBtn.disabled = true;
       try {
         if (!window.MediaRecorder || !stream) throw new Error('This browser does not support recording the live camera stream.');
+        if (!navigator.storage?.getDirectory) {
+          throw new Error('Long match recording needs Safari local storage. Exit Private Browsing and reload this page.');
+        }
         if (!recordingMicStream) {
           try {
             recordingMicStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -1192,33 +1435,95 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         const options = { videoBitsPerSecond };
         if (hasAudio) options.audioBitsPerSecond = 192000;
         if (mimeType) options.mimeType = mimeType;
+        const extension = mimeType?.includes('webm') ? 'webm' : 'mp4';
+        const name = `soccer-turret-${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`;
+        await openRecordingStorage(name, videoBitsPerSecond, Number(recordMinutes.value));
+        if (navigator.wakeLock?.request) {
+          try { recordingWakeLock = await navigator.wakeLock.request('screen'); } catch (_) {}
+        }
         recorder = new MediaRecorder(recordingOutputStream, options);
         recordingChunks = [];
-        recorder.ondataavailable = event => { if (event.data?.size) recordingChunks.push(event.data); };
+        recordingWriteQueue = Promise.resolve();
+        recordingWriteError = null;
+        recorder.ondataavailable = event => {
+          if (!event.data?.size || recordingWriteError || !recordingWriter) return;
+          recordingWriteQueue = recordingWriteQueue
+            .then(() => recordingWriter.request('chunk', { blob: event.data }))
+            .then(result => {
+              const elapsedMinutes = Math.floor((performance.now() - recordingStartedAt) / 60000);
+              recordStorageReadout.textContent = `Recording · ${elapsedMinutes} min elapsed · ${formatBytes(result.total)} written to Safari storage.`;
+            })
+            .catch(error => {
+              recordingWriteError = error;
+              status(`Recording storage failed: ${error?.message || error}. Stopping the clip.`);
+              if (recorder?.state === 'recording') recorder.stop();
+            });
+        };
         recorder.start(1000);
+        recordingStartedAt = performance.now();
+        const durationMinutes = Number(recordMinutes.value);
+        recordingTimer = setTimeout(() => {
+          if (recorder?.state === 'recording') {
+            status(`Recording limit reached at ${durationMinutes} minutes. Finalizing the clip…`);
+            stopAndSaveRecording();
+          }
+        }, durationMinutes * 60 * 1000);
         autoZoom.disabled = recordingZoomMode === 'camera';
         maxZoom.disabled = recordingZoomMode === 'camera';
+        recordMinutes.disabled = true;
         recordBtn.disabled = true; stopRecordBtn.disabled = false;
         const actualBitrate = recorder.videoBitsPerSecond || videoBitsPerSecond;
         status((recordingZoomMode === 'crop' ? 'Recording the auto-framed camera view at ' : 'Recording the iPhone camera stream at ') +
           (settings.width || video.videoWidth) + '×' + (settings.height || video.videoHeight) +
-          ` · ${Math.round(actualBitrate / 1000000)} Mbps video` + (hasAudio ? ', audio on.' : ', video only.'));
+          ` · ${Math.round(actualBitrate / 1000000)} Mbps video · ${durationMinutes} min limit · writing to Safari storage` +
+          (hasAudio ? ', audio on.' : ', video only.') +
+          (recordingWakeLock ? ' Screen kept awake.' : ' Keep Safari open and the iPhone awake.') +
+          (recordingStoragePersisted ? ' Persistent storage granted.' : ' Keep enough phone storage free; Safari may evict site data.'));
       } catch (error) {
+        clearTimeout(recordingTimer);
+        recordingTimer = 0;
+        if (recordingWriter) {
+          try { await recordingWriter.request('close'); } catch (_) {}
+          recordingWriter.dispose();
+          recordingWriter = null;
+        }
+        if (recordingFolder && recordingFileName) await recordingFolder.removeEntry(recordingFileName).catch(() => {});
+        recordingFileHandle = null; recordingFolder = null; recordingFileName = '';
+        if (recordingWakeLock) {
+          const wakeLock = recordingWakeLock;
+          recordingWakeLock = null;
+          try { await wakeLock.release(); } catch (_) {}
+        }
         recordingCaptureStream?.getTracks().forEach(track => track.stop());
         recordingMicStream?.getTracks().forEach(track => track.stop());
         recordingCaptureStream = null; recordingMicStream = null; recordingOutputStream = null;
         recordingCanvasContext = null; recordingCanvas = null; recordingZoomMode = 'camera';
-        autoZoom.disabled = false; maxZoom.disabled = false;
+        autoZoom.disabled = false; maxZoom.disabled = false; recordMinutes.disabled = false;
         if (recorder?.state === 'recording') recorder.stop();
         recorder = null;
-        recordBtn.disabled = false;
+        recordBtn.disabled = !running;
         status(`Could not start recording: ${error?.message || error}`);
       }
     });
+    recordMinutes.addEventListener('input', updateRecordingPlan);
     stopRecordBtn.addEventListener('click', stopAndSaveRecording);
-    window.addEventListener('pagehide', () => { running = false; stream?.getTracks().forEach(track => track.stop()); navigator.sendBeacon('/stop'); });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && recorder?.state === 'recording') {
+        status('Safari is leaving the foreground. Stopping and finalizing the recording…');
+        stopAndSaveRecording();
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      if (recorder?.state === 'recording') stopAndSaveRecording();
+      running = false;
+      stream?.getTracks().forEach(track => track.stop());
+      navigator.sendBeacon('/stop');
+    });
 
     updateReadouts(); setMotorUi();
+    updateRecordingPlan();
+    refreshRecordingStorageInfo();
+    refreshRecordingLibrary();
     sendSettings().catch(error => status(`Could not sync settings with the ESP32: ${error?.message || error}`));
   </script>
 </body>
