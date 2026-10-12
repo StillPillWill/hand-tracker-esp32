@@ -11,7 +11,11 @@ const script = [...page.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]
 new vm.Script(script, { filename: 'tracker_page.h inline script' });
 
 function extractFunction(name) {
-  const start = script.indexOf(`    function ${name}(`);
+  const starts = [
+    script.indexOf(`    function ${name}(`),
+    script.indexOf(`    async function ${name}(`)
+  ].filter(index => index >= 0);
+  const start = starts.length ? Math.min(...starts) : -1;
   assert.notEqual(start, -1, `embedded page must define ${name}`);
   const end = script.indexOf('\n    }', start);
   assert.notEqual(end, -1, `${name} must have a complete function body`);
@@ -20,7 +24,7 @@ function extractFunction(name) {
 
 function loadLogic() {
   const names = [
-    'getSoccerProviders', 'getBundledSoccerModel', 'playerEngagement',
+    'getSoccerProviders', 'getBundledSoccerModel', 'getWasmModelCandidates', 'playerEngagement',
     'activePlayerGroup', 'centerPlay', 'compositionZoomLimit', 'calculateFocusOfPlay'
   ];
   const functions = names.map(extractFunction).join('\n');
@@ -29,6 +33,7 @@ function loadLogic() {
     SOCCER_WASM_MODEL_URL: 'phone-int8.onnx',
     SOCCER_MODEL_NAME: 'phone-float.onnx',
     SOCCER_WASM_MODEL_NAME: 'phone-int8.onnx',
+    Uint8Array,
     clamp: (value, min, max) => Math.max(min, Math.min(max, value)),
     maxZoom: { value: '4' },
     previousPlayFocus: null,
@@ -38,11 +43,21 @@ function loadLogic() {
   return { ...logic, context };
 }
 
-test('iPhone Safari selects int8 WASM even when Safari exposes WebGPU', () => {
+test('iPhone Safari opportunistically tries WebGPU when Safari exposes it', () => {
   const { getSoccerProviders, getBundledSoccerModel } = loadLogic();
   const iphone = {
     userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Version/26.0 Mobile Safari/605.1.15',
     platform: 'iPhone', maxTouchPoints: 5, gpu: {}
+  };
+  assert.deepEqual(Array.from(getSoccerProviders(iphone)), ['webgpu', 'wasm']);
+  assert.equal(getBundledSoccerModel(iphone).name, 'phone-float.onnx');
+});
+
+test('iPhone Safari without WebGPU uses the smaller int8 WASM model directly', () => {
+  const { getSoccerProviders, getBundledSoccerModel } = loadLogic();
+  const iphone = {
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Version/26.0 Mobile Safari/605.1.15',
+    platform: 'iPhone', maxTouchPoints: 5
   };
   assert.deepEqual(Array.from(getSoccerProviders(iphone)), ['wasm']);
   assert.equal(getBundledSoccerModel(iphone).name, 'phone-int8.onnx');
@@ -52,7 +67,7 @@ test('iPad Safari is not mistaken for a supported macOS WebGPU browser', () => {
   const { getSoccerProviders } = loadLogic();
   const ipad = {
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 Version/26.0 Safari/605.1.15',
-    platform: 'MacIntel', maxTouchPoints: 5, gpu: {}
+    platform: 'MacIntel', maxTouchPoints: 5
   };
   assert.deepEqual(Array.from(getSoccerProviders(ipad)), ['wasm']);
 });
@@ -65,6 +80,42 @@ test('supported desktop Chrome keeps WebGPU and the float model', () => {
   };
   assert.deepEqual(Array.from(getSoccerProviders(chrome)), ['webgpu', 'wasm']);
   assert.equal(getBundledSoccerModel(chrome).name, 'phone-float.onnx');
+});
+
+test('failed WebGPU setup loads cached/downloaded int8 before trying float WASM', async () => {
+  const { getWasmModelCandidates } = loadLogic();
+  const floatBytes = new Uint8Array([1, 2]);
+  const int8Bytes = new Uint8Array([3, 4]);
+  const result = await getWasmModelCandidates(floatBytes, true,
+    async () => ({ bytes: int8Bytes, name: 'phone-int8.onnx' }));
+  assert.equal(result.error, null);
+  assert.equal(result.candidates[0].bytes, int8Bytes);
+  assert.equal(result.candidates[0].name, 'phone-int8.onnx');
+  assert.equal(result.candidates[1].bytes, floatBytes);
+});
+
+test('successful WebGPU setup does not fetch the WASM fallback model', async () => {
+  const { getWasmModelCandidates } = loadLogic();
+  let loaded = false;
+  const floatBytes = new Uint8Array([1, 2]);
+  const result = await getWasmModelCandidates(floatBytes, false, async () => {
+    loaded = true;
+    return { bytes: new Uint8Array([3, 4]), name: 'phone-int8.onnx' };
+  });
+  assert.equal(loaded, false);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].bytes, floatBytes);
+});
+
+test('failed fallback download still preserves float WASM as a last resort', async () => {
+  const { getWasmModelCandidates } = loadLogic();
+  const floatBytes = new Uint8Array([1, 2]);
+  const result = await getWasmModelCandidates(floatBytes, true, async () => {
+    throw new Error('offline');
+  });
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].bytes, floatBytes);
+  assert.match(result.error.message, /offline/);
 });
 
 test('focus of play combines a visible ball with nearby players', () => {

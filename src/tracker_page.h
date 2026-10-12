@@ -689,16 +689,33 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const providers = [];
       // ONNX Runtime Web 1.30 supports WebNN on Chromium for Windows only.
       if (/Windows NT/i.test(userAgent) && chromiumBrowser && nav.ml) providers.push('webnn');
-      // Restrict WebGPU to Chromium platforms listed by the ONNX Runtime Web support matrix.
-      // Safari may expose navigator.gpu, but ONNX Runtime Web does not support Safari on iOS.
+      // Restrict the supported WebGPU path to Chromium platforms in the ONNX Runtime matrix.
       const supportedChromiumWebGpu = !iosBrowser && chromiumBrowser
         && /Windows NT|Android|Macintosh|Mac OS X/i.test(userAgent);
-      if (nav.gpu && supportedChromiumWebGpu) providers.push('webgpu');
+      // Safari 26+ may expose WebGPU. ORT Web does not list iOS Safari as supported, so
+      // this is an experimental attempt with an int8-WASM model fallback on failure.
+      const experimentalIosWebGpu = iosBrowser && Boolean(nav.gpu);
+      if (nav.gpu && (supportedChromiumWebGpu || experimentalIosWebGpu)) providers.push('webgpu');
       providers.push('wasm');
       return providers;
     }
 
-    async function setupSoccerDetector(modelBytes, classThresholds) {
+    async function getWasmModelCandidates(modelBytes, webgpuFailed, loadWasmFallbackModel) {
+      const candidates = [{ bytes: modelBytes, name: '' }];
+      if (!webgpuFailed || !loadWasmFallbackModel) return { candidates, error: null };
+      try {
+        const fallback = await loadWasmFallbackModel();
+        const fallbackBytes = fallback?.bytes instanceof Uint8Array
+          ? fallback.bytes : new Uint8Array(fallback?.bytes || 0);
+        if (!fallbackBytes.byteLength) throw new Error('The phone WASM fallback model is empty.');
+        candidates.unshift({ bytes: fallbackBytes, name: fallback.name || '' });
+        return { candidates, error: null };
+      } catch (error) {
+        return { candidates, error };
+      }
+    }
+
+    async function setupSoccerDetector(modelBytes, classThresholds, loadWasmFallbackModel = null) {
       await ensureOfflineAssetCache();
       modelBytes = modelBytes instanceof Uint8Array ? modelBytes : new Uint8Array(modelBytes);
       if (!modelBytes.byteLength) throw new Error('The selected model file is empty.');
@@ -708,6 +725,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         ? Math.max(1, Math.min(4, Number(navigator.hardwareConcurrency) || 2))
         : 1;
       let lastError = null;
+      let webgpuFailed = false;
       for (const provider of providers) {
         try {
           status(provider === 'webnn'
@@ -730,23 +748,39 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           const executionProviders = provider === 'webnn'
             ? [{ name: 'webnn', deviceType: 'npu', powerPreference: 'high-performance' }, 'wasm']
             : provider === 'webgpu' ? ['webgpu', 'wasm'] : ['wasm'];
-          const session = await ort.InferenceSession.create(modelBytes, {
-            executionProviders, graphOptimizationLevel: 'all', logSeverityLevel: 3
-          });
-          let detector = null;
-          try {
-            detector = createSoccerOrtDetector(ort, session, provider, wasmThreads, classThresholds);
-            status(provider === 'webnn' ? 'Preparing the soccer model on WebNN NPU…'
-              : provider === 'webgpu' ? 'Preparing the soccer model on WebGPU…' : 'Preparing the soccer model on WASM…');
-            await detector.warmup();
-            return detector;
-          } catch (error) {
-            detector?.close?.();
-            session.release?.();
-            throw error;
+          let modelCandidates = [{ bytes: modelBytes, name: '' }];
+          if (provider === 'wasm') {
+            if (webgpuFailed && loadWasmFallbackModel) {
+              status('WebGPU did not start on this iPhone; loading the smaller WASM soccer model…');
+            }
+            const selection = await getWasmModelCandidates(modelBytes, webgpuFailed, loadWasmFallbackModel);
+            modelCandidates = selection.candidates;
+            if (selection.error) lastError = selection.error;
           }
+          for (const candidate of modelCandidates) {
+            let session = null;
+            let detector = null;
+            try {
+              session = await ort.InferenceSession.create(candidate.bytes, {
+                executionProviders, graphOptimizationLevel: 'all', logSeverityLevel: 3
+              });
+              detector = createSoccerOrtDetector(ort, session, provider, wasmThreads, classThresholds);
+              detector.modelBytes = candidate.bytes;
+              detector.modelName = candidate.name;
+              status(provider === 'webnn' ? 'Preparing the soccer model on WebNN NPU…'
+                : provider === 'webgpu' ? 'Preparing the soccer model on WebGPU…' : 'Preparing the soccer model on WASM…');
+              await detector.warmup();
+              return detector;
+            } catch (error) {
+              detector?.close?.();
+              session?.release?.();
+              lastError = error;
+            }
+          }
+          if (provider === 'webgpu') webgpuFailed = true;
         } catch (error) {
           lastError = error;
+          if (provider === 'webgpu') webgpuFailed = true;
         }
       }
       throw new Error(`Could not create the soccer detector. Check cellular access for the ONNX runtime. ${lastError?.message || lastError || ''}`);
@@ -764,11 +798,11 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       });
     }
 
-    async function readSavedSoccerModel() {
+    async function readSavedSoccerModel(key = 'active') {
       const database = await openSoccerModelDatabase();
       try {
         return await new Promise((resolve, reject) => {
-          const request = database.transaction('models', 'readonly').objectStore('models').get('active');
+          const request = database.transaction('models', 'readonly').objectStore('models').get(key);
           request.onsuccess = () => resolve(request.result || null);
           request.onerror = () => reject(request.error || new Error('Could not read the saved soccer model.'));
         });
@@ -777,13 +811,13 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       }
     }
 
-    async function saveSoccerModel(modelBytes, name) {
+    async function saveSoccerModel(modelBytes, name, key = 'active') {
       const database = await openSoccerModelDatabase();
       try {
         await new Promise((resolve, reject) => {
           const transaction = database.transaction('models', 'readwrite');
           const copy = modelBytes.buffer.slice(modelBytes.byteOffset, modelBytes.byteOffset + modelBytes.byteLength);
-          transaction.objectStore('models').put({ name, bytes: copy, size: modelBytes.byteLength }, 'active');
+          transaction.objectStore('models').put({ name, bytes: copy, size: modelBytes.byteLength }, key);
           transaction.oncomplete = () => resolve();
           transaction.onerror = () => reject(transaction.error || new Error('Could not save the soccer model.'));
           transaction.onabort = () => reject(transaction.error || new Error('Local model storage is full.'));
@@ -792,6 +826,17 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       } finally {
         database.close();
       }
+    }
+
+    async function loadPhoneWasmFallbackModel() {
+      const saved = await readSavedSoccerModel('phone-wasm-fallback');
+      if (saved?.bytes) return { bytes: new Uint8Array(saved.bytes), name: saved.name || SOCCER_WASM_MODEL_NAME };
+      const response = await fetch(SOCCER_WASM_MODEL_URL, { mode: 'cors', cache: 'no-store' });
+      if (!response.ok) throw new Error(`Could not download the phone WASM fallback model (${response.status}).`);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.byteLength < 1000000) throw new Error('The phone WASM fallback model download is incomplete.');
+      try { await saveSoccerModel(bytes, SOCCER_WASM_MODEL_NAME, 'phone-wasm-fallback'); } catch (_) {}
+      return { bytes, name: SOCCER_WASM_MODEL_NAME };
     }
 
     async function refreshSavedSoccerModelButton() {
@@ -840,8 +885,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         status(`Loading soccer model (${(modelBytes.byteLength / 1048576).toFixed(1)} MB)…`);
         const classThresholds = PHONE_VIEW_MODEL_NAMES.has(modelName)
           ? PHONE_VIEW_CLASS_THRESHOLDS : SOCCER_CLASS_THRESHOLDS;
-        const soccerDetector = await setupSoccerDetector(modelBytes, classThresholds);
-        setSoccerDetector(soccerDetector, modelName);
+        const loadWasmFallbackModel = modelName === SOCCER_MODEL_NAME
+          && getSoccerProviders().includes('webgpu') ? loadPhoneWasmFallbackModel : null;
+        const soccerDetector = await setupSoccerDetector(modelBytes, classThresholds, loadWasmFallbackModel);
+        setSoccerDetector(soccerDetector, soccerDetector.modelName || modelName);
         if (remember) {
           let saved = false;
           try { saved = await saveSoccerModel(modelBytes, modelName); } catch (_) {}
@@ -1431,9 +1478,12 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
             try {
               const savedThresholds = PHONE_VIEW_MODEL_NAMES.has(saved.name)
                 ? PHONE_VIEW_CLASS_THRESHOLDS : SOCCER_CLASS_THRESHOLDS;
-              const savedDetector = await setupSoccerDetector(new Uint8Array(saved.bytes), savedThresholds);
+              const loadWasmFallbackModel = saved.name === SOCCER_MODEL_NAME
+                && getSoccerProviders().includes('webgpu') ? loadPhoneWasmFallbackModel : null;
+              const savedDetector = await setupSoccerDetector(
+                new Uint8Array(saved.bytes), savedThresholds, loadWasmFallbackModel);
               if (request !== startToken) { savedDetector.close?.(); return; }
-              setSoccerDetector(savedDetector, saved.name || 'saved model');
+              setSoccerDetector(savedDetector, savedDetector.modelName || saved.name || 'saved model');
             } catch (error) {
               status(`Saved soccer model could not load (${error?.message || error}); using the general detector.`);
             }
