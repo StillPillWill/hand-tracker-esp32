@@ -69,7 +69,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <div class="row"><button id="record" class="secondary" disabled>Record match</button><button id="stopRecord" class="secondary" disabled>Stop &amp; save clip</button></div>
     <p class="small">The page requests up to 4K at 30 fps and shows the camera settings the phone actually supplies. When auto-framing can zoom, recording uses a full-resolution crop surface so the saved view follows the play; hardware camera zoom is also applied when available. The crop uses phone camera frames, preserving any stabilization supplied by its camera pipeline; tracking smoothing and motor acceleration limits also ease turret movement. With auto-framing off, it records the camera stream directly. Microphone access is requested only when recording starts.</p>
     <p class="small">Recordings are written to Safari storage in one-second chunks so a full match does not build one huge in-memory video. Keep Safari open in the foreground while recording. After stopping, tap a clip below to save it to Files; delete exported clips here to free phone storage. Long recordings need Safari storage enabled and enough free space.</p>
-    <p class="small">Detection and the selected model stay on the iPhone. The custom soccer model requests WebNN/NPU when exposed by the browser, then tries WebGPU and WebAssembly. Safari does not expose a direct Core ML/Neural Engine path to this page; WebGPU uses the phone GPU, not its Neural Engine.</p>
+    <p class="small">Detection and the selected model stay on the iPhone. The custom soccer model uses WebNN/NPU or WebGPU only on platforms supported by ONNX Runtime Web. Its current iPhone path is multithreaded WebAssembly CPU; Safari does not expose a direct Core ML/Neural Engine path to this page.</p>
     <div id="recordingLibrary" aria-live="polite"></div>
   </div>
 
@@ -678,14 +678,27 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       };
     }
 
+    function getSoccerProviders(nav = navigator) {
+      const userAgent = nav.userAgent || '';
+      const iosBrowser = /iPhone|iPad|iPod/i.test(userAgent)
+        || (nav.platform === 'MacIntel' && nav.maxTouchPoints > 1);
+      const chromiumBrowser = /(?:Chrome|Chromium|Edg)\//i.test(userAgent);
+      const providers = [];
+      // ONNX Runtime Web 1.30 supports WebNN on Chromium for Windows only.
+      if (/Windows NT/i.test(userAgent) && chromiumBrowser && nav.ml) providers.push('webnn');
+      // Its WebGPU provider supports Chromium on Windows, Android, and macOS, but not iOS/Safari.
+      if (!iosBrowser && chromiumBrowser && /Windows NT|Android|Macintosh|Mac OS X/i.test(userAgent) && nav.gpu) {
+        providers.push('webgpu');
+      }
+      providers.push('wasm');
+      return providers;
+    }
+
     async function setupSoccerDetector(modelBytes, classThresholds) {
       await ensureOfflineAssetCache();
       modelBytes = modelBytes instanceof Uint8Array ? modelBytes : new Uint8Array(modelBytes);
       if (!modelBytes.byteLength) throw new Error('The selected model file is empty.');
-      const providers = [];
-      if (navigator.ml) providers.push('webnn');
-      if (navigator.gpu) providers.push('webgpu');
-      providers.push('wasm');
+      const providers = getSoccerProviders();
       const canUseWasmThreads = window.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
       const wasmThreads = canUseWasmThreads
         ? Math.max(1, Math.min(4, Number(navigator.hardwareConcurrency) || 2))
