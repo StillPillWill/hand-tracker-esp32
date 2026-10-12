@@ -689,14 +689,11 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const providers = [];
       // ONNX Runtime Web 1.30 supports WebNN on Chromium for Windows only.
       if (/Windows NT/i.test(userAgent) && chromiumBrowser && nav.ml) providers.push('webnn');
-      // Safari 26 exposes WebGPU, but ONNX Runtime Web does not list iOS Safari as supported.
-      // Try it only when the browser exposes the API; session creation and warmup fall back to WASM.
+      // Restrict WebGPU to Chromium platforms listed by the ONNX Runtime Web support matrix.
+      // Safari may expose navigator.gpu, but ONNX Runtime Web does not support Safari on iOS.
       const supportedChromiumWebGpu = !iosBrowser && chromiumBrowser
         && /Windows NT|Android|Macintosh|Mac OS X/i.test(userAgent);
-      const experimentalIosWebGpu = iosBrowser && Boolean(nav.gpu);
-      if (nav.gpu && (supportedChromiumWebGpu || experimentalIosWebGpu)) {
-        providers.push('webgpu');
-      }
+      if (nav.gpu && supportedChromiumWebGpu) providers.push('webgpu');
       providers.push('wasm');
       return providers;
     }
