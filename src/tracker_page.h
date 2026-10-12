@@ -69,7 +69,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
   </div>
 
   <div class="card"><div id="stage"><canvas id="canvas"></canvas></div>
-    <p class="small">Use a stable tripod and keep the entire yaw/pitch travel clear. Stop the motors before handling the mount.</p></div>
+    <p class="small">The green reticle marks the calculated aim point. In Focus of play mode it follows the ball and nearby players, then the active group if the ball is hidden. Use a stable tripod and keep the full yaw/pitch travel clear.</p></div>
 
   <video id="video" playsinline muted hidden></video>
   <script type="module">
@@ -886,6 +886,38 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         ctx.strokeRect(x, y, w, h);
         ctx.fillStyle = ctx.strokeStyle;
         ctx.fillText(isBall ? 'BALL' : d.name === 'referee' ? 'REFEREE' : 'PLAYER', x + 3, Math.max(18, y - 4));
+      }
+      const focusAge = now - lastLockAt;
+      if (focusAge >= 0 && focusAge < 900) {
+        const focusX = (filteredX * sourceWidth - cropX) * scaleX;
+        const focusY = (filteredY * sourceHeight - cropY) * scaleY;
+        if (focusX >= 0 && focusX <= outWidth && focusY >= 0 && focusY <= outHeight) {
+          const radius = Math.max(16, outWidth / 80);
+          ctx.save();
+          ctx.globalAlpha = 1 - 0.55 * (focusAge / 900);
+          ctx.strokeStyle = '#a3e635';
+          ctx.fillStyle = '#a3e635';
+          ctx.lineWidth = Math.max(2, outWidth / 700);
+          ctx.beginPath();
+          ctx.arc(focusX, focusY, radius, 0, Math.PI * 2);
+          ctx.moveTo(focusX - radius * 1.55, focusY);
+          ctx.lineTo(focusX - radius * 0.55, focusY);
+          ctx.moveTo(focusX + radius * 0.55, focusY);
+          ctx.lineTo(focusX + radius * 1.55, focusY);
+          ctx.moveTo(focusX, focusY - radius * 1.55);
+          ctx.lineTo(focusX, focusY - radius * 0.55);
+          ctx.moveTo(focusX, focusY + radius * 0.55);
+          ctx.lineTo(focusX, focusY + radius * 1.55);
+          ctx.stroke();
+          const focusLabel = trackMode.value === 'play' ? 'PLAY FOCUS'
+            : trackMode.value === 'ball' ? 'BALL AIM' : 'PLAYER GROUP';
+          ctx.font = `700 ${Math.max(14, outWidth / 55)}px system-ui`;
+          const labelWidth = ctx.measureText(focusLabel).width;
+          const labelX = focusX + radius + 8 + labelWidth <= outWidth
+            ? focusX + radius + 8 : Math.max(0, focusX - radius - 8 - labelWidth);
+          ctx.fillText(focusLabel, labelX, clamp(focusY - radius, 18, outHeight - 4));
+          ctx.restore();
+        }
       }
       drawRecordingFrame(now);
       if (running) requestAnimationFrame(frame);
