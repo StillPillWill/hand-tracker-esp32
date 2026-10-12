@@ -129,6 +129,8 @@ void handleRoot(HTTPRequest *req, HTTPResponse *res) {
   (void)req;
   res->setHeader("Content-Type", "text/html; charset=utf-8");
   res->setHeader("Cache-Control", "no-store");
+  res->setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res->setHeader("Cross-Origin-Embedder-Policy", "require-corp");
   res->print(TRACKER_HTML);
 }
 

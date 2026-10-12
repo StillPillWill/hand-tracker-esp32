@@ -481,7 +481,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const SOCCER_CLASS_NAMES = ['ball', 'player', 'referee'];
     const SOCCER_CLASS_THRESHOLDS = [0.26, 0.18, 0.18];
 
-    function createSoccerOrtDetector(ort, session, provider) {
+    function createSoccerOrtDetector(ort, session, provider, wasmThreads) {
       const inputName = session.inputNames[0];
       const outputName = session.outputNames[0];
       const inputSize = SOCCER_INPUT_SIZE;
@@ -557,6 +557,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
 
       return {
         provider,
+        wasmThreads,
         async warmup() {
           inputData.fill(0);
           const tensor = new ort.Tensor('float32', inputData, [1, 3, inputSize, inputSize]);
@@ -601,6 +602,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       if (navigator.ml) providers.push('webnn');
       if (navigator.gpu) providers.push('webgpu');
       providers.push('wasm');
+      const canUseWasmThreads = window.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+      const wasmThreads = canUseWasmThreads
+        ? Math.max(1, Math.min(4, Number(navigator.hardwareConcurrency) || 2))
+        : 1;
       let lastError = null;
       for (const provider of providers) {
         try {
@@ -614,7 +619,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           const runtimeUrl = `${ORT_DIST}${runtimeFile}`;
           const ort = await import(runtimeUrl);
           ort.env.wasm.wasmPaths = ORT_DIST;
-          ort.env.wasm.numThreads = 1;
+          ort.env.wasm.numThreads = wasmThreads;
           const executionProviders = provider === 'webnn'
             ? [{ name: 'webnn', deviceType: 'npu', powerPreference: 'high-performance' }, 'wasm']
             : provider === 'webgpu' ? ['webgpu', 'wasm'] : ['wasm'];
@@ -623,7 +628,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           });
           let detector = null;
           try {
-            detector = createSoccerOrtDetector(ort, session, provider);
+            detector = createSoccerOrtDetector(ort, session, provider, wasmThreads);
             status(provider === 'webnn' ? 'Preparing the soccer model on WebNN NPU…'
               : provider === 'webgpu' ? 'Preparing the soccer model on WebGPU…' : 'Preparing the soccer model on WASM…');
             await detector.warmup();
@@ -703,8 +708,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       detectorKind = 'soccer';
       detectorFailed = false;
       useGenericDetectorBtn.disabled = false;
-      const providerLabel = soccerDetector.provider === 'webnn' ? 'WebNN NPU requested'
-        : soccerDetector.provider === 'webgpu' ? 'WebGPU with WASM fallback' : 'WebAssembly CPU';
+      const wasmLabel = `${soccerDetector.wasmThreads}-thread WASM`;
+      const providerLabel = soccerDetector.provider === 'webnn' ? `WebNN NPU requested · ${wasmLabel} fallback`
+        : soccerDetector.provider === 'webgpu' ? `WebGPU · ${wasmLabel} fallback`
+          : `WebAssembly CPU · ${wasmLabel}`;
       detectorReadout.textContent = `Active detector: soccer YOLO (${modelName}) · ${providerLabel}`;
     }
 

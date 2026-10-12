@@ -18,7 +18,7 @@ The browser page is the intended setup; it does not require installing a native 
 
 ## Detection acceleration
 
-The soccer ONNX path loads ONNX Runtime Web 1.30.0 from jsDelivr. It requests WebNN's NPU device when the browser exposes `navigator.ml`, then tries WebGPU with WASM fallback, then WASM CPU. ONNX Runtime's current browser matrix does not list Safari on iOS for WebNN or WebGPU, so those paths are feature-detected and need testing on the target iPhone. The model also fails ONNX Runtime Web's legacy WebGL provider on unsupported YOLO operators, so that provider is not used. Safari does not expose a direct Core ML/Neural Engine path to this page.
+The soccer ONNX path loads ONNX Runtime Web 1.30.0 from jsDelivr. It requests WebNN's NPU device when the browser exposes `navigator.ml`, then tries WebGPU with WASM fallback, then WASM CPU. The ESP32 page response enables cross-origin isolation so compatible Safari versions can use WebAssembly threads; ONNX Runtime uses up to four phone CPU threads when `SharedArrayBuffer` is available and falls back to one thread otherwise. Cross-origin runtime and model downloads must allow CORS. ONNX Runtime's current browser matrix does not list Safari on iOS for WebNN or WebGPU, so those paths are feature-detected and need testing on the target iPhone. The model also fails ONNX Runtime Web's legacy WebGL provider on unsupported YOLO operators, so that provider is not used. Safari does not expose a direct Core ML/Neural Engine path to this page.
 
 ## Model status
 
