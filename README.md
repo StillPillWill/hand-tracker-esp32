@@ -60,7 +60,7 @@ Default soft travel limits are ±70° yaw, +35° up, and −25° down. At boot, 
 5. Open https://192.168.4.1:8000 and accept the local self-signed certificate warning. On first use, tap **Download + load soccer model**; Safari saves it locally when storage is available. If the phone cannot reach the repository, load the `.onnx` file from iPhone Files instead.
 6. Tap **Start camera + tracker** and grant rear-camera permission. Grant microphone permission when starting a recording if you want audio. Enable the motors only after checking the turret is clear. Use STOP to halt and hold the camera; disabling the motors releases holding torque.
 
-The preview and detector are capped to a 1920-pixel-wide drawing surface and about 8 inferences per second to keep tracking responsive. The recording uses the source camera track instead.
+The preview processes each decoded camera frame with Safari's `requestVideoFrameCallback()` when available, avoiding duplicate canvas work at the display refresh rate; other browsers fall back to animation frames. The preview drawing surface is capped at 1920 pixels wide, and detector inference is capped at about 8 times per second. The recording uses the source camera track instead.
 
 ## References
 

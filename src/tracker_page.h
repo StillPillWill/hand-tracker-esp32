@@ -114,6 +114,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     let detector = null, detectorKind = 'coco', detectorBusy = false, detectorFailed = false;
     let genericDelegate = 'GPU', modelLoading = false;
     let stream = null, running = false, motorsEnabled = false, startToken = 0;
+    let frameRequestId = 0, frameRequestKind = 'animation';
     let lastInfer = 0, lastSend = 0, lastLockAt = 0, settingsTimer = 0;
     let detections = [], filteredX = 0.5, filteredY = 0.5, currentZoom = 1;
     let videoTrack = null, hardwareZoomRange = null, hardwareZoomActive = false;
@@ -955,6 +956,29 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       return Math.min(userLimit, contextLimit);
     }
 
+    function scheduleTrackerFrame() {
+      if (!running || frameRequestId) return;
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        frameRequestKind = 'video';
+        frameRequestId = video.requestVideoFrameCallback(frame);
+      } else {
+        frameRequestKind = 'animation';
+        frameRequestId = requestAnimationFrame(frame);
+      }
+    }
+
+    function cancelTrackerFrame() {
+      if (!frameRequestId) return;
+      if (frameRequestKind === 'video') {
+        if (typeof video.cancelVideoFrameCallback === 'function') {
+          video.cancelVideoFrameCallback(frameRequestId);
+        }
+      } else {
+        cancelAnimationFrame(frameRequestId);
+      }
+      frameRequestId = 0;
+    }
+
     function calculateFocusOfPlay(ball, predictedBall, players, ballHint = null) {
       const playAnchor = ball || predictedBall;
       if (playAnchor) {
@@ -1134,7 +1158,6 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         }
       }
       drawRecordingFrame(now);
-      if (running) requestAnimationFrame(frame);
     }
 
     function drawRecordingFrame(now) {
@@ -1154,6 +1177,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     function frame(now) {
+      frameRequestId = 0;
       if (!running) return;
       if (video.readyState >= 2) {
         if (detector && !detectorBusy && !detectorFailed && now - lastInfer >= 120) {
@@ -1173,9 +1197,8 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           }
         }
         drawFrame(now);
-      } else {
-        requestAnimationFrame(frame);
       }
+      scheduleTrackerFrame();
     }
 
     async function startCameraAndTracking() {
@@ -1254,7 +1277,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         }
         if (request !== startToken) return;
         detectorFailed = false;
-        if (!running) { running = true; requestAnimationFrame(frame); }
+        if (!running) { running = true; scheduleTrackerFrame(); }
         status('Tracking live. The phone sends only yaw/pitch targets to the ESP32.');
         startBtn.textContent = 'Tracker running';
       } catch (error) {
@@ -1328,6 +1351,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     async function stopCamera() {
       startToken++;
       running = false;
+      cancelTrackerFrame();
       if (recorder && recorder.state !== 'inactive') await stopAndSaveRecording();
       if (detectorKind !== 'soccer') {
         detector?.close?.(); detector = null;
@@ -1516,6 +1540,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     window.addEventListener('pagehide', () => {
       if (recorder?.state === 'recording') stopAndSaveRecording();
       running = false;
+      cancelTrackerFrame();
       stream?.getTracks().forEach(track => track.stop());
       navigator.sendBeacon('/stop');
     });
