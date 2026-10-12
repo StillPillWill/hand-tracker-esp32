@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <AccelStepper.h>
 #include <HTTPSServer.hpp>
 #include <SSLCert.hpp>
@@ -75,6 +76,54 @@ AxisControl pitchAxis{&pitchStepper, PITCH_STEPS_PER_DEG, -PITCH_DOWN_LIMIT_STEP
 SSLCert *tlsCert = nullptr;
 HTTPSServer *httpsServer = nullptr;
 bool motorsEnabled = false;
+
+static bool loadStoredTlsCertificate() {
+  Preferences storage;
+  if (!storage.begin("soccer-tls", true)) return false;
+
+  const size_t certLength = storage.getBytesLength("certificate");
+  const size_t keyLength = storage.getBytesLength("private-key");
+  if (!certLength || !keyLength || certLength > UINT16_MAX || keyLength > UINT16_MAX) {
+    storage.end();
+    return false;
+  }
+
+  unsigned char *certData = static_cast<unsigned char *>(malloc(certLength));
+  unsigned char *keyData = static_cast<unsigned char *>(malloc(keyLength));
+  if (!certData || !keyData) {
+    free(certData);
+    free(keyData);
+    storage.end();
+    return false;
+  }
+
+  const size_t certRead = storage.getBytes("certificate", certData, certLength);
+  const size_t keyRead = storage.getBytes("private-key", keyData, keyLength);
+  storage.end();
+  if (certRead != certLength || keyRead != keyLength) {
+    free(certData);
+    free(keyData);
+    return false;
+  }
+
+  tlsCert = new SSLCert(certData, static_cast<uint16_t>(certLength),
+                        keyData, static_cast<uint16_t>(keyLength));
+  return tlsCert != nullptr;
+}
+
+static bool storeTlsCertificate() {
+  if (!tlsCert) return false;
+  Preferences storage;
+  if (!storage.begin("soccer-tls", false)) return false;
+
+  const size_t certLength = tlsCert->getCertLength();
+  const size_t keyLength = tlsCert->getPKLength();
+  const bool saved = certLength && keyLength &&
+      storage.putBytes("certificate", tlsCert->getCertData(), certLength) == certLength &&
+      storage.putBytes("private-key", tlsCert->getPKData(), keyLength) == keyLength;
+  storage.end();
+  return saved;
+}
 
 static float clampFloat(float value, float low, float high) {
   return fmaxf(low, fminf(high, value));
@@ -358,13 +407,20 @@ void setup() {
   }
   Serial.printf("AP ready: %s, IP %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
-  Serial.println("Generating the local HTTPS certificate (first boot can take a while)...");
-  tlsCert = new SSLCert();
-  const int certResult = createSelfSignedCert(*tlsCert, KEYSIZE_2048,
-      "CN=192.168.4.1,O=ESP32 Soccer Turret", "20261011000000", "20361011000000");
-  if (certResult != 0) {
-    Serial.printf("Certificate generation failed: 0x%02X\n", certResult);
-    while (true) delay(1000);
+  if (loadStoredTlsCertificate()) {
+    Serial.println("Loaded the saved local HTTPS certificate.");
+  } else {
+    Serial.println("Generating the local HTTPS certificate (first boot can take a while)...");
+    tlsCert = new SSLCert();
+    const int certResult = createSelfSignedCert(*tlsCert, KEYSIZE_2048,
+        "CN=192.168.4.1,O=ESP32 Soccer Turret", "20261011000000", "20361011000000");
+    if (certResult != 0) {
+      Serial.printf("Certificate generation failed: 0x%02X\n", certResult);
+      while (true) delay(1000);
+    }
+    if (!storeTlsCertificate()) {
+      Serial.println("Warning: could not save the HTTPS certificate; the browser may ask again after reboot.");
+    }
   }
 
   httpsServer = new HTTPSServer(tlsCert, 8000, 2);

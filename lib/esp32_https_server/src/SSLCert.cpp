@@ -1,4 +1,5 @@
 #include "SSLCert.hpp"
+#include <mbedtls/oid.h>
 
 namespace httpsserver {
 
@@ -151,6 +152,9 @@ static int gen_key(SSLCert &certCtx, SSLKeySize keySize) {
  *
  * Based on programs/x509/cert_write.c
  */
+// DER GeneralNames sequence containing an iPAddress SAN for the ESP32 AP.
+static const unsigned char ESP32_IP_SUBJECT_ALT_NAME[] = {0x30, 0x06, 0x87, 0x04, 192, 168, 4, 1};
+
 static int cert_write(SSLCert &certCtx, std::string dn, std::string validityFrom, std::string validityTo) {
   int funcRes = 0;
   int stepRes = 0;
@@ -220,6 +224,16 @@ static int cert_write(SSLCert &certCtx, std::string dn, std::string validityFrom
   stepRes = mbedtls_x509write_crt_set_basic_constraints( &crt, 1, 0 );
   if (stepRes != 0) {
     funcRes = HTTPS_SERVER_ERROR_CERTGEN_VALIDITY;
+    goto error_after_cert;
+  }
+
+  // The phone opens the ESP32 by IP address. Include an IP subjectAltName so
+  // browsers do not have to fall back to the deprecated commonName matching rule.
+  stepRes = mbedtls_x509write_crt_set_extension(
+      &crt, MBEDTLS_OID_SUBJECT_ALT_NAME, MBEDTLS_OID_SIZE(MBEDTLS_OID_SUBJECT_ALT_NAME),
+      0, ESP32_IP_SUBJECT_ALT_NAME, sizeof(ESP32_IP_SUBJECT_ALT_NAME));
+  if (stepRes != 0) {
+    funcRes = HTTPS_SERVER_ERROR_CERTGEN_WRITE;
     goto error_after_cert;
   }
 

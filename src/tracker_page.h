@@ -69,7 +69,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <div class="row"><button id="record" class="secondary" disabled>Record match</button><button id="stopRecord" class="secondary" disabled>Stop &amp; save clip</button></div>
     <p class="small">The page requests up to 4K at 30 fps and shows the camera settings the phone actually supplies. When auto-framing can zoom, recording uses a full-resolution crop surface so the saved view follows the play; hardware camera zoom is also applied when available. The crop uses phone camera frames, preserving any stabilization supplied by its camera pipeline; tracking smoothing and motor acceleration limits also ease turret movement. With auto-framing off, it records the camera stream directly. Microphone access is requested only when recording starts.</p>
     <p class="small">Recordings are written to Safari storage in one-second chunks so a full match does not build one huge in-memory video. Keep Safari open in the foreground while recording. After stopping, tap a clip below to save it to Files; delete exported clips here to free phone storage. Long recordings need Safari storage enabled and enough free space.</p>
-    <p class="small">Detection and the selected model stay on the iPhone. The custom soccer model uses WebNN/NPU or WebGPU only on platforms supported by ONNX Runtime Web. Its current iPhone path is multithreaded WebAssembly CPU; Safari does not expose a direct Core ML/Neural Engine path to this page.</p>
+    <p class="small">Detection and the selected model stay on the iPhone. Safari 26+ may expose WebGPU; when it does, the page tries ONNX Runtime WebGPU and falls back to multithreaded WebAssembly if setup or warmup fails. WebGPU uses the phone's graphics GPU, not its Neural Engine. Safari does not expose Core ML/Neural Engine directly to this page.</p>
     <div id="recordingLibrary" aria-live="polite"></div>
   </div>
 
@@ -689,8 +689,12 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const providers = [];
       // ONNX Runtime Web 1.30 supports WebNN on Chromium for Windows only.
       if (/Windows NT/i.test(userAgent) && chromiumBrowser && nav.ml) providers.push('webnn');
-      // Its WebGPU provider supports Chromium on Windows, Android, and macOS, but not iOS/Safari.
-      if (!iosBrowser && chromiumBrowser && /Windows NT|Android|Macintosh|Mac OS X/i.test(userAgent) && nav.gpu) {
+      // Safari 26 exposes WebGPU, but ONNX Runtime Web does not list iOS Safari as supported.
+      // Try it only when the browser exposes the API; session creation and warmup fall back to WASM.
+      const supportedChromiumWebGpu = !iosBrowser && chromiumBrowser
+        && /Windows NT|Android|Macintosh|Mac OS X/i.test(userAgent);
+      const experimentalIosWebGpu = iosBrowser && Boolean(nav.gpu);
+      if (nav.gpu && (supportedChromiumWebGpu || experimentalIosWebGpu)) {
         providers.push('webgpu');
       }
       providers.push('wasm');
