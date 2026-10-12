@@ -43,7 +43,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <h2>Camera and tracking</h2>
     <div class="row"><button id="start">Start camera + tracker</button><button id="stop" class="secondary" disabled>Stop camera</button></div>
     <p id="status">Ready. Load the baseline or experimental phone-view soccer model.</p>
-    <span class="pill" id="trackingState">No camera</span><span class="pill" id="targetReadout">Aim: center</span><span class="pill" id="zoomReadout">Zoom: 1.0×</span><span class="pill" id="cameraReadout">Camera: not started</span>
+    <span class="pill" id="trackingState">No camera</span><span class="pill" id="targetReadout">Aim: center</span><span class="pill" id="zoomReadout">Zoom: 1.0×</span><span class="pill" id="cameraReadout">Camera: not started</span><span class="pill" id="inferenceReadout">Inference: —</span>
     <label class="setting">Track mode
       <select id="trackMode"><option value="play">Focus of play</option><option value="ball">Ball only</option><option value="players">Active player group</option></select>
     </label>
@@ -87,6 +87,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const targetReadout = document.querySelector('#targetReadout');
     const zoomReadout = document.querySelector('#zoomReadout');
     const cameraReadout = document.querySelector('#cameraReadout');
+    const inferenceReadout = document.querySelector('#inferenceReadout');
     const startBtn = document.querySelector('#start');
     const stopBtn = document.querySelector('#stop');
     const motorBtn = document.querySelector('#motorToggle');
@@ -119,6 +120,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     let stream = null, running = false, motorsEnabled = false, startToken = 0;
     let frameRequestId = 0, frameRequestKind = 'animation';
     let lastInfer = 0, lastSend = 0, lastLockAt = 0, settingsTimer = 0;
+    const inferenceSamples = [];
     let detections = [], filteredX = 0.5, filteredY = 0.5, currentZoom = 1;
     let videoTrack = null, hardwareZoomRange = null, hardwareZoomActive = false;
     let hardwareZoomPending = false, hardwareZoomNow = 1, lastZoomApply = 0;
@@ -789,6 +791,8 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       detector = soccerDetector;
       detectorKind = 'soccer';
       detectorFailed = false;
+      inferenceSamples.length = 0;
+      inferenceReadout.textContent = 'Inference: waiting for camera';
       useGenericDetectorBtn.disabled = false;
       const wasmLabel = `${soccerDetector.wasmThreads}-thread WASM`;
       const providerLabel = soccerDetector.provider === 'webnn' ? `WebNN NPU requested · ${wasmLabel} fallback`
@@ -878,6 +882,8 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       detector = null;
       detectorKind = 'coco';
       detectorFailed = false;
+      inferenceSamples.length = 0;
+      inferenceReadout.textContent = 'Inference: waiting for camera';
       useGenericDetectorBtn.disabled = true;
       detectorReadout.textContent = 'Active detector: general COCO model. Choose a soccer ONNX file to replace it.';
       status('General COCO detector selected. Start the camera to load it.');
@@ -1197,6 +1203,19 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       zoomReadout.textContent = `Zoom: ${currentZoom.toFixed(1)}×`;
     }
 
+    function recordInferenceSample(startedAt, finishedAt) {
+      inferenceSamples.push({ at: finishedAt, duration: Math.max(0, finishedAt - startedAt) });
+      while (inferenceSamples.length > 20 || finishedAt - inferenceSamples[0].at > 5000) inferenceSamples.shift();
+      if (inferenceSamples.length < 2) {
+        inferenceReadout.textContent = `Inference: ${inferenceSamples[0].duration.toFixed(0)} ms`;
+        return;
+      }
+      const meanMs = inferenceSamples.reduce((sum, sample) => sum + sample.duration, 0) / inferenceSamples.length;
+      const elapsedMs = Math.max(1, finishedAt - inferenceSamples[0].at);
+      const rate = (inferenceSamples.length - 1) * 1000 / elapsedMs;
+      inferenceReadout.textContent = `Inference: ${meanMs.toFixed(0)} ms · ${rate.toFixed(1)} FPS`;
+    }
+
     function drawFrame(now) {
       const sourceWidth = video.videoWidth;
       const sourceHeight = video.videoHeight;
@@ -1292,10 +1311,15 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           lastInfer = now;
           detectorBusy = true;
           const inferenceToken = startToken;
+          const inferenceStartedAt = performance.now();
           try {
             Promise.resolve(detector.detectForVideo(video, now))
               .then(result => {
-                if (running && inferenceToken === startToken) updateTracking(result, performance.now());
+                const finishedAt = performance.now();
+                if (running && inferenceToken === startToken) {
+                  recordInferenceSample(inferenceStartedAt, finishedAt);
+                  updateTracking(result, finishedAt);
+                }
               })
               .catch(error => {
                 detectorFailed = true;
