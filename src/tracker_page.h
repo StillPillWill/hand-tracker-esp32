@@ -722,6 +722,11 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
             : provider === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs';
           const runtimeUrl = `${ORT_DIST}${runtimeFile}`;
           const ort = await import(runtimeUrl);
+          if (provider === 'webgpu') {
+            const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+            if (!adapter) throw new Error('No high-performance WebGPU adapter is available.');
+            ort.env.webgpu.adapter = adapter;
+          }
           ort.env.wasm.wasmPaths = ORT_DIST;
           ort.env.wasm.numThreads = wasmThreads;
           ort.env.wasm.proxy = provider === 'wasm';
