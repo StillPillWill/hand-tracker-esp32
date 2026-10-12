@@ -28,8 +28,9 @@ function extractFunction(name) {
 
 function loadLogic() {
   const names = [
-    'getSoccerProviders', 'getBundledSoccerModel', 'getWasmModelCandidates', 'playerEngagement',
-    'activePlayerGroup', 'centerPlay', 'compositionZoomLimit', 'calculateFocusOfPlay'
+    'getSoccerProviders', 'getBundledSoccerModel', 'getWasmModelCandidates', 'playerActivitySignals',
+    'playerEngagement', 'playerFocusWeight', 'activePlayerGroup', 'centerPlay',
+    'isPlayerEngagedInPlay', 'playersInActivePlay', 'compositionZoomLimit', 'calculateFocusOfPlay'
   ];
   const functions = names.map(extractFunction).join('\n');
   const context = {
@@ -140,10 +141,67 @@ test('focus of play combines a visible ball with nearby players', () => {
     { cx: 0.46, cy: 0.52, score: 0.8, motion: 0.1, vx: -0.02, vy: 0.02 }
   ];
   const focus = calculateFocusOfPlay(ball, null, players, ball, 5000);
-  assert.match(focus.label, /ball \+ 2 nearby players/);
+  assert.match(focus.label, /ball \+ 2 engaged players/);
   assert.equal(focus.framingSubjects.length, 3);
   assert.ok(focus.target.x > 0.46 && focus.target.x < 0.53);
   assert.equal(focus.zoomLimit, 4);
+});
+
+test('player activity estimates approach direction and discounts a stale ball hint', () => {
+  const { playerActivitySignals } = loadLogic();
+  const player = { cx: 0.62, cy: 0.5, motion: 0.6, vx: -0.2, vy: 0 };
+  const current = playerActivitySignals(player, { cx: 0.5, cy: 0.5 });
+  const fading = playerActivitySignals(player, { cx: 0.5, cy: 0.5, focusConfidence: 0.25 });
+  assert.equal(current.state, 'closing');
+  assert.equal(current.approach, 0.6);
+  assert.equal(fading.approach, 0.15);
+  assert.ok(current.engagement > fading.engagement);
+});
+
+test('weighted play center favors a player closing on the ball', () => {
+  const { centerPlay } = loadLogic();
+  const ball = { cx: 0.5, cy: 0.5, score: 0.9 };
+  const players = [
+    { cx: 0.62, cy: 0.5, score: 0.9, motion: 0.6, vx: -0.2, vy: 0 },
+    { cx: 0.38, cy: 0.5, score: 0.9, motion: 0, vx: 0, vy: 0 }
+  ];
+  const focus = centerPlay(ball, players);
+  assert.ok(focus.x > ball.cx, 'closing player should pull focus farther than the stationary player');
+});
+
+test('focus framing and zoom bounds follow engaged players instead of a distant stationary player', () => {
+  const { calculateFocusOfPlay } = loadLogic();
+  const ball = { cx: 0.5, cy: 0.5, x: 0.49, y: 0.49, w: 0.02, h: 0.02, score: 0.9 };
+  const players = [
+    { cx: 0.58, cy: 0.5, score: 0.9, motion: 0.6, vx: -0.2, vy: 0 },
+    { cx: 0.72, cy: 0.5, score: 0.9, motion: 0, vx: 0, vy: 0 }
+  ];
+  const focus = calculateFocusOfPlay(ball, null, players, ball, 5000);
+  assert.match(focus.label, /1 engaged player · 1 closing/);
+  assert.equal(focus.framingSubjects.length, 2);
+  assert.equal(focus.zoomLimit, 1.8);
+  assert.ok(focus.target.x > 0.5);
+});
+
+test('focus labels a stationary fallback as nearby instead of active', () => {
+  const { calculateFocusOfPlay } = loadLogic();
+  const ball = { cx: 0.5, cy: 0.5, x: 0.49, y: 0.49, w: 0.02, h: 0.02, score: 0.9 };
+  const player = { cx: 0.72, cy: 0.5, score: 0.9, motion: 0, vx: 0, vy: 0 };
+  const focus = calculateFocusOfPlay(ball, null, [player], ball, 5000);
+  assert.match(focus.label, /1 nearby player/);
+  assert.equal(focus.framingSubjects.length, 2);
+});
+
+test('occlusion fallback center weights an approaching player more than nearby stationary players', () => {
+  const { activePlayerGroup } = loadLogic();
+  const players = [
+    { cx: 0.25, cy: 0.5, score: 0.9, motion: 0.7, vx: 0.1, vy: 0 },
+    { cx: 0.29, cy: 0.5, score: 0.9, motion: 0, vx: 0, vy: 0 },
+    { cx: 0.33, cy: 0.5, score: 0.9, motion: 0, vx: 0, vy: 0 }
+  ];
+  const group = activePlayerGroup(players, { cx: 0.43, cy: 0.5, focusConfidence: 1 }, 5000);
+  assert.ok(group);
+  assert.ok(group.x < 0.29, 'weighted centroid should shift toward the player moving into play');
 });
 
 test('focus of play uses the predicted ball during a short occlusion', () => {

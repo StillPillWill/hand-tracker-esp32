@@ -47,7 +47,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <label class="setting">Track mode
       <select id="trackMode"><option value="play">Focus of play</option><option value="ball">Ball only</option><option value="players">Active player group</option></select>
     </label>
-    <p class="small">Focus of play combines the ball and nearby players when visible. During occlusion it predicts the ball, then uses its fading recent position to score player groups by proximity, movement, convergence, activity, and continuity. Auto-frame keeps a wider field view for an isolated ball or player, then zooms further as it sees a larger active group.</p>
+    <p class="small">YOLO detects the ball and players. Tracking estimates who is moving, closing on the ball, or positioned near play, then uses those activity weights in a center-of-mass focus. During ball occlusion it scores active player groups near the fading ball position. Auto-frame fits the ball and engaged players so the zoom follows the action.</p>
     <div class="row"><button id="loadBundledSoccerModel">Download + load phone-view model</button><button id="loadBaselineSoccerModel" class="secondary">Load general soccer baseline</button><button id="loadSavedSoccerModel" class="secondary" disabled>Load saved model</button><button id="useGenericDetector" class="secondary" disabled>Use general detector</button></div>
     <p class="small">The default phone-view model was adapted using handheld soccer footage and improves ball and player detection on held-out phone-view samples with machine-generated labels. The general soccer baseline remains available for broadcast-style footage. Models stay on the phone. After the first successful load, Safari caches the model runtime and downloads for offline sessions when site storage is available; iOS may clear cached site data. To use another ONNX model, choose it below.</p>
     <label class="setting">Use a different soccer model (.onnx)
@@ -1070,15 +1070,35 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       };
     }
 
-    function playerEngagement(player, ballHint) {
-      if (!ballHint) return 0;
+    function playerActivitySignals(player, ballHint) {
+      const motion = clamp(player.motion || 0, 0, 1);
+      if (!ballHint) return { motion, proximity: 0, approach: 0, engagement: 0, state: motion >= 0.24 ? 'moving' : 'positioned' };
       const dx = ballHint.cx - player.cx;
       const dy = ballHint.cy - player.cy;
       const distance = Math.hypot(dx, dy);
-      const proximity = clamp(1 - distance / 0.42, 0, 1);
-      if (!distance || !player.motion) return proximity * 0.35;
-      const towardBall = (player.vx * dx + player.vy * dy) / (distance * Math.max(0.01, Math.hypot(player.vx, player.vy)));
-      return proximity * (0.35 + player.motion * 0.35 + Math.max(0, towardBall) * 0.5);
+      const hintConfidence = clamp(ballHint.focusConfidence ?? 1, 0, 1);
+      const proximity = clamp(1 - distance / 0.42, 0, 1) * hintConfidence;
+      const speed = Math.hypot(player.vx || 0, player.vy || 0);
+      const alignment = distance > 0.001 && speed > 0.02
+        ? clamp((player.vx * dx + player.vy * dy) / (distance * speed), -1, 1)
+        : 0;
+      const approach = Math.max(0, alignment) * motion * hintConfidence;
+      const engagement = proximity * (0.22 + motion * 0.38 + approach * 0.55);
+      const state = proximity >= 0.2 && approach >= 0.22 ? 'closing'
+        : proximity >= 0.15 && motion >= 0.28 ? 'active near play'
+        : proximity >= 0.3 ? 'near play'
+        : motion >= 0.24 ? 'moving' : 'positioned';
+      return { motion, proximity, approach, engagement, state };
+    }
+
+    function playerEngagement(player, ballHint) {
+      return playerActivitySignals(player, ballHint).engagement;
+    }
+
+    function playerFocusWeight(player, ballHint) {
+      const signals = playerActivitySignals(player, ballHint);
+      return Math.max(0.1, player.score || 0)
+        * (0.42 + signals.motion * 0.38 + signals.engagement * 0.85);
     }
 
     function activePlayerGroup(players, ballHint = null, now) {
@@ -1087,9 +1107,9 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       let best = null;
       for (const anchor of players) {
         const group = players.filter(player => Math.hypot(player.cx - anchor.cx, player.cy - anchor.cy) < radius);
-        const totalWeight = group.reduce((sum, player) => sum + Math.max(0.15, player.score) * (1 + player.motion * 0.7), 0);
-        const x = group.reduce((sum, player) => sum + player.cx * Math.max(0.15, player.score) * (1 + player.motion * 0.7), 0) / totalWeight;
-        const y = group.reduce((sum, player) => sum + player.cy * Math.max(0.15, player.score) * (1 + player.motion * 0.7), 0) / totalWeight;
+        const totalWeight = group.reduce((sum, player) => sum + playerFocusWeight(player, ballHint), 0);
+        const x = group.reduce((sum, player) => sum + player.cx * playerFocusWeight(player, ballHint), 0) / totalWeight;
+        const y = group.reduce((sum, player) => sum + player.cy * playerFocusWeight(player, ballHint), 0) / totalWeight;
         const averageMotion = group.reduce((sum, player) => sum + player.motion, 0) / group.length;
         const averageConfidence = group.reduce((sum, player) => sum + player.score, 0) / group.length;
         const activeFraction = group.filter(player => player.motion >= 0.12).length / group.length;
@@ -1111,37 +1131,53 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         const ballProximity = ballHint
           ? Math.max(0, 1 - Math.hypot(x - ballHint.cx, y - ballHint.cy) / 0.45) * hintConfidence
           : 0;
-        const engagement = group.reduce((sum, player) => sum + playerEngagement(player, ballHint), 0) / group.length * hintConfidence;
+        const activitySignals = group.map(player => playerActivitySignals(player, ballHint));
+        const engagement = activitySignals.reduce((sum, signals) => sum + signals.engagement, 0) / group.length;
+        const approach = activitySignals.reduce((sum, signals) => sum + signals.approach, 0) / group.length;
         const focusAge = Math.max(0, now - previousPlayFocusAt);
         const continuity = previousPlayFocus
           ? Math.max(0, 1 - Math.hypot(x - previousPlayFocus.x, y - previousPlayFocus.y) / 0.38)
             * clamp(1 - focusAge / 1400, 0, 1)
           : 0;
         const groupSize = clamp((group.length - 1) / 4, 0, 1);
-        const score = groupSize * 0.32 + averageMotion * 0.20 + activeFraction * 0.10
-          + ballProximity * 0.26 + engagement * 0.22 + convergence * 0.14
-          + continuity * 0.18 + compactness * 0.12 + averageConfidence * 0.06;
+        const score = groupSize * 0.30 + averageMotion * 0.17 + activeFraction * 0.08
+          + ballProximity * 0.24 + engagement * 0.20 + approach * 0.12 + convergence * 0.13
+          + continuity * 0.17 + compactness * 0.11 + averageConfidence * 0.06;
         if (!best || score > best.score) {
           best = { group, x, y, score, engagement, activity: averageMotion, activeFraction,
-            convergence, ballProximity, continuity, compactness, hintConfidence };
+            approach, convergence, ballProximity, continuity, compactness, hintConfidence };
         }
       }
       return best;
     }
 
     function centerPlay(ball, players) {
-      const ballWeight = 2.2;
+      const ballWeight = 1.5 + clamp(ball.score || 0, 0, 1) * 1.5;
       let totalWeight = ballWeight;
       let x = ball.cx * ballWeight;
       let y = ball.cy * ballWeight;
       for (const player of players) {
-        const weight = Math.max(0.15, player.score)
-          * (1 + player.motion * 0.55 + playerEngagement(player, ball) * 0.45);
+        const weight = playerFocusWeight(player, ball);
         totalWeight += weight;
         x += player.cx * weight;
         y += player.cy * weight;
       }
       return { x: x / totalWeight, y: y / totalWeight };
+    }
+
+    function isPlayerEngagedInPlay(player, ballHint) {
+      const signals = playerActivitySignals(player, ballHint);
+      return signals.proximity >= 0.6 || signals.engagement >= 0.14 || signals.approach >= 0.18;
+    }
+
+    function playersInActivePlay(players, ballHint) {
+      if (!players.length) return [];
+      const engaged = players.filter(player => isPlayerEngagedInPlay(player, ballHint));
+      if (engaged.length) return engaged;
+      const nearest = players.reduce((best, player) =>
+        Math.hypot(player.cx - ballHint.cx, player.cy - ballHint.cy)
+          < Math.hypot(best.cx - ballHint.cx, best.cy - ballHint.cy) ? player : best);
+      return [nearest];
     }
 
     function compositionZoomLimit(subjectCount, ballAnchored) {
@@ -1179,14 +1215,21 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const playAnchor = ball || predictedBall;
       if (playAnchor) {
         const nearbyPlayers = players.filter(player => Math.hypot(player.cx - playAnchor.cx, player.cy - playAnchor.cy) < 0.34);
-        const target = centerPlay(playAnchor, nearbyPlayers);
+        const activePlayers = playersInActivePlay(nearbyPlayers, playAnchor);
+        const target = centerPlay(playAnchor, activePlayers);
+        const closingPlayers = activePlayers.filter(player => playerActivitySignals(player, playAnchor).state === 'closing').length;
+        const activityLabel = closingPlayers ? ` · ${closingPlayers} closing` : '';
+        const engagedCount = activePlayers.filter(player => isPlayerEngagedInPlay(player, playAnchor)).length;
+        const participantLabel = engagedCount
+          ? `${engagedCount} engaged ${engagedCount === 1 ? 'player' : 'players'}`
+          : `${activePlayers.length} nearby ${activePlayers.length === 1 ? 'player' : 'players'}`;
         return {
           target,
-          framingSubjects: [playAnchor, ...nearbyPlayers],
-          zoomLimit: compositionZoomLimit(nearbyPlayers.length, true),
+          framingSubjects: [playAnchor, ...activePlayers],
+          zoomLimit: compositionZoomLimit(activePlayers.length, true),
           label: ball
-            ? `Play focus · ball + ${nearbyPlayers.length} nearby players`
-            : `Play focus · predicted ball + ${nearbyPlayers.length} nearby players`
+            ? `Play focus · ball + ${participantLabel}${activityLabel}`
+            : `Play focus · predicted ball + ${participantLabel}${activityLabel}`
         };
       }
 
@@ -1224,6 +1267,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const ball = chooseBall(balls, now);
       const predicted = ball || predictBall(now);
       const playHint = predicted || recentBallHint(now);
+      for (const player of players) player.activityState = playerActivitySignals(player, playHint).state;
       let target = null;
       let framingSubjects = [];
       let focusZoomLimit = Number(maxZoom.value);
@@ -1333,7 +1377,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         ctx.strokeStyle = isBall ? '#ffd166' : '#67e8f9';
         ctx.strokeRect(x, y, w, h);
         ctx.fillStyle = ctx.strokeStyle;
-        ctx.fillText(isBall ? 'BALL' : d.name === 'referee' ? 'REFEREE' : 'PLAYER', x + 3, Math.max(18, y - 4));
+        const label = isBall ? 'BALL' : d.name === 'referee' ? 'REFEREE'
+          : d.activityState && d.activityState !== 'positioned'
+            ? `PLAYER · ${d.activityState.toUpperCase()}` : 'PLAYER';
+        ctx.fillText(label, x + 3, Math.max(18, y - 4));
       }
       const focusAge = now - lastLockAt;
       if (focusAge >= 0 && focusAge < 900) {
