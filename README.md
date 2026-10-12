@@ -61,6 +61,10 @@ Default soft travel limits are ±70° yaw, +35° up, and −25° down. At boot, 
 5. Open **https://192.168.4.1:8000** and accept the local self-signed certificate warning on first visit so Safari can grant camera access. The certificate identity is stored in NVS, so it remains stable across reboots. `localhost` would point to the iPhone itself; use the ESP32 address above. Load the phone-view model; use **Load general soccer baseline** for a broadcast-style view. If GitHub is unreachable, choose the `.onnx` file from iPhone Files instead.
 6. Tap **Start camera + tracker** and grant rear-camera permission. Grant microphone permission when starting a recording if you want audio. Enable the motors only after checking the turret is clear. Use STOP to halt and hold the camera; disabling the motors releases holding torque.
 
+## Checks
+
+Run `node --test test/soccer-page.test.mjs` to check the embedded page's iPhone/desktop provider selection and focus-of-play behavior. Run `pio run` to build the ESP32 firmware.
+
 The preview processes each decoded camera frame with Safari's `requestVideoFrameCallback()` when available, avoiding duplicate canvas work at the display refresh rate; other browsers fall back to animation frames. The preview drawing surface is capped at 1920 pixels wide, and detector inference is capped at about 8 times per second. The recording uses the source camera track instead.
 
 ## References
