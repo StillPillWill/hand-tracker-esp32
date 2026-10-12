@@ -64,7 +64,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     <label class="check"><input id="autoZoom" type="checkbox" checked><span>Auto-frame the detected play</span></label>
     <div class="row"><button id="record" class="secondary" disabled>Record clip</button><button id="stopRecord" class="secondary" disabled>Stop &amp; save clip</button></div>
     <p class="small">The page requests up to 4K at 30 fps and shows the camera settings the phone actually supplies. When auto-framing can zoom, recording uses a full-resolution crop surface so the saved view follows the play; hardware camera zoom is also applied when available. The crop uses phone camera frames, preserving any stabilization supplied by its camera pipeline; tracking smoothing and motor acceleration limits also ease turret motion. With auto-framing off, it records the camera stream directly. Microphone access is requested only when recording starts.</p>
-    <p class="small">Detection and the selected model stay on the iPhone. The custom soccer ONNX path requests a WebNN NPU when available, then tries WebGPU with WASM fallback, then WASM CPU. WebGPU uses the phone GPU; Safari support for a direct Core ML/Neural Engine provider is not currently listed.</p>
+    <p class="small">Detection and the selected model stay on the iPhone. The custom soccer model requests WebNN/NPU when exposed by the browser, then tries WebGPU and WebAssembly. Safari does not expose a direct Core ML/Neural Engine path to this page; WebGPU uses the phone GPU, not its Neural Engine.</p>
     <a id="lastClip" class="clip" hidden></a>
   </div>
 

@@ -14,7 +14,7 @@ Python 3.10 or 3.11 and an NVIDIA GPU with CUDA are recommended. CPU training is
 
 Run python -m pip install -r model/requirements.txt, then run python model/train_soccer.py from the repository root.
 
-The script fine-tunes YOLO11n at 1280 pixels, evaluates the validation split, and exports a fixed-shape ONNX model. Outputs stay in work/soccer-model/training and are not committed automatically.
+The script fine-tunes YOLO11n at 1280 pixels, evaluates the validation split, and exports a fixed-shape ONNX model. Outputs stay in work/soccer-model/training and are not committed automatically. Use `--name` to keep each experiment in its own run folder; `--weights` can point to a previous checkpoint. Use `--validate-only --weights path\to\best.pt --name experiment-name` to validate and export an existing checkpoint without starting another training run. Metrics are written inside that run's folder so experiments do not overwrite one another.
 
 To use a different dataset, pass --data C:\path\to\sideline-soccer\data.yaml to the training script.
 
@@ -30,7 +30,7 @@ The export metadata identifies the upstream Ultralytics license as AGPL-3.0. The
 
 For the bundled baseline, open the ESP32 page in Safari and tap **Download + load soccer model**. It downloads the ONNX file through the phone's internet connection and saves it on the phone when browser storage is available. To use a newly trained or different model, copy its `.onnx` file into iPhone Files, choose it under **Use a different soccer model**, and tap **Load chosen model**. In either case inference runs on the phone; the ESP32 receives only aim and motor commands.
 
-The browser decoder expects the YOLO output for a 1280×1280 input with classes in this exact order: `ball`, `player`, `referee`. The current baseline uses confidence thresholds of 0.26 for balls and 0.18 for players/referees. It requests the WebNN NPU device if the browser exposes it, then tries ONNX Runtime WebGPU with WASM fallback, then WASM CPU. The generic MediaPipe COCO detector remains available as the default. The runtime downloads from jsDelivr, so the phone needs an internet route while loading it.
+The browser decoder expects the YOLO output for a 1280×1280 input with classes in this exact order: `ball`, `player`, `referee`. The current baseline uses confidence thresholds of 0.26 for balls and 0.18 for players/referees. It requests the WebNN NPU device if the browser exposes it, then tries ONNX Runtime WebGPU with WASM fallback, then WASM CPU. This model fails ONNX Runtime Web's legacy WebGL provider on unsupported YOLO operators, so WebGL is not used. The generic MediaPipe COCO detector remains available as a fallback. The ONNX runtime downloads from jsDelivr, so the phone needs an internet route while loading it.
 
 ## Baseline run and browser check
 
@@ -39,3 +39,5 @@ The 2026-10-11 YOLO11n run stopped after 40 epochs and exported a 10.6 MB ONNX m
 The ONNX export metadata identifies the upstream Ultralytics license as AGPL-3.0. Its warm WebGPU inference took 66–106 ms on the local NVIDIA Pascal desktop; that timing does not predict iPhone performance. Measure the target phone's runtime and capture settings at the field.
 
 The baseline's validation metrics come from broadcast frames, not the intended iPhone sideline viewpoint. Do not treat those scores as proof of sideline recall. Measure ball recall and false locks from held-out games recorded at the actual mount position before relying on automatic tracking.
+
+A 25-epoch fine-tune from the baseline was checked on the same 100-image split and through the same browser/WebGPU decoder. At the app thresholds and IoU 0.50, ball precision/recall changed from 0.485/0.590 to 0.484/0.554; aggregate mAP50-95 changed from 0.496 to 0.492. The candidate improved some player scores but had more referee false positives. It is not bundled because it did not improve ball recall or overall mAP50-95. A sideline, match-separated dataset is still needed to finalize a model for the intended camera position.

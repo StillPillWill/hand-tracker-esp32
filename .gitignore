@@ -2,6 +2,7 @@
 /work/
 .vscode/
 .idea/
+__pycache__/
 .DS_Store
 Thumbs.db
 *.elf

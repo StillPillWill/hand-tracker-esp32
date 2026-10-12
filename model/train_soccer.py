@@ -17,7 +17,7 @@ OUTPUT_DIR = REPO_ROOT / "work" / "soccer-model" / "training"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train and export the soccer detector baseline.")
+    parser = argparse.ArgumentParser(description="Train, validate, and export the soccer detector.")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATASET / "data.yaml",
                         help="Path to a YOLO detection dataset YAML.")
     parser.add_argument("--weights", default="yolo11n.pt",
@@ -26,8 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=1280)
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--name", default="yolo11n-soccer",
+                        help="Unique run name under work/soccer-model/training.")
     parser.add_argument("--device", default=None,
                         help="Ultralytics device selector; defaults to CUDA when available.")
+    parser.add_argument("--validate-only", action="store_true",
+                        help="Skip training and validate/export the checkpoint supplied with --weights.")
     return parser.parse_args()
 
 
@@ -54,30 +58,37 @@ def main() -> None:
     weights = str(weights_path.resolve()) if weights_path.is_file() else args.weights
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     os.chdir(OUTPUT_DIR)
-    model = YOLO(weights)
     wandb_callbacks.callbacks.clear()
-    model.train(
-        data=str(dataset_yaml),
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        workers=args.workers,
-        device=device,
-        seed=42,
-        deterministic=True,
-        patience=20,
-        cache="disk",
-        project=str(OUTPUT_DIR),
-        name="yolo11n-soccer",
-        exist_ok=True,
-        plots=True,
-    )
+    if args.validate_only:
+        best_checkpoint = Path(weights).resolve()
+        if not best_checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {best_checkpoint}")
+    else:
+        model = YOLO(weights)
+        model.train(
+            data=str(dataset_yaml),
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            workers=args.workers,
+            device=device,
+            seed=42,
+            deterministic=True,
+            patience=20,
+            cache="disk",
+            project=str(OUTPUT_DIR),
+            name=args.name,
+            exist_ok=True,
+            plots=True,
+        )
+        best_checkpoint = OUTPUT_DIR / args.name / "weights" / "best.pt"
+        if not best_checkpoint.is_file():
+            raise FileNotFoundError(f"Training did not produce a best checkpoint: {best_checkpoint}")
 
-    best_checkpoint = OUTPUT_DIR / "yolo11n-soccer" / "weights" / "best.pt"
     best_model = YOLO(str(best_checkpoint))
     metrics = best_model.val(
         data=str(dataset_yaml), imgsz=args.imgsz, device=device, split="val",
-        project=str(OUTPUT_DIR), name="yolo11n-soccer-validation", exist_ok=True,
+        project=str(OUTPUT_DIR), name=f"{args.name}-validation", exist_ok=True,
     )
     per_class_metrics = {}
     for metric_index, class_index in enumerate(metrics.box.ap_class_index):
@@ -96,7 +107,9 @@ def main() -> None:
         "metrics": {key: float(value) for key, value in metrics.results_dict.items()},
         "perClassMetrics": per_class_metrics,
     }
-    (OUTPUT_DIR / "validation-metrics.json").write_text(
+    metrics_path = OUTPUT_DIR / args.name / "validation-metrics.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
     best_model.export(format="onnx", imgsz=args.imgsz, dynamic=False, simplify=False, opset=17)

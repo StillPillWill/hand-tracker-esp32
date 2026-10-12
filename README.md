@@ -17,7 +17,7 @@ The browser page is the intended setup; it does not require installing a native 
 
 ## Detection acceleration
 
-The soccer ONNX path loads ONNX Runtime Web 1.30.0 from jsDelivr. It requests WebNN's NPU device when the browser exposes `navigator.ml`, then tries WebGPU with WASM fallback, then WASM CPU. ONNX Runtime's current browser matrix does not list Safari on iOS for WebNN or WebGPU, so those paths are feature-detected and need testing on the target iPhone. Safari 26 does ship WebGPU, which runs general compute on the phone GPU through Metal; that does not establish Neural Engine use. The generic MediaPipe model tries its GPU delegate and falls back to CPU. The page reports the requested/selected runtime path and does not claim Core ML use without browser support.
+The soccer ONNX path loads ONNX Runtime Web 1.30.0 from jsDelivr. It requests WebNN's NPU device when the browser exposes `navigator.ml`, then tries WebGPU with WASM fallback, then WASM CPU. ONNX Runtime's current browser matrix does not list Safari on iOS for WebNN or WebGPU, so those paths are feature-detected and need testing on the target iPhone. The model also fails ONNX Runtime Web's legacy WebGL provider on unsupported YOLO operators, so that provider is not used. Safari does not expose a direct Core ML/Neural Engine path to this page.
 
 ## Model status
 
