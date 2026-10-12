@@ -479,7 +479,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const SOCCER_MODEL_NAME = 'soccer-yolo11n-1280.onnx';
     const SOCCER_INPUT_SIZE = 1280;
     const SOCCER_CLASS_NAMES = ['ball', 'player', 'referee'];
-    const SOCCER_CLASS_THRESHOLDS = [0.26, 0.18, 0.18];
+    const SOCCER_CLASS_THRESHOLDS = [0.12, 0.18, 0.18];
 
     function createSoccerOrtDetector(ort, session, provider, wasmThreads) {
       const inputName = session.inputNames[0];
