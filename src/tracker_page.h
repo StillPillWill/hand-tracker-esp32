@@ -486,7 +486,6 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const outputName = session.outputNames[0];
       const inputSize = SOCCER_INPUT_SIZE;
       const area = inputSize * inputSize;
-      const inputData = new Float32Array(area * 3);
       const inputCanvas = document.createElement('canvas');
       inputCanvas.width = inputCanvas.height = inputSize;
       const inputContext = inputCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
@@ -558,9 +557,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       return {
         provider,
         wasmThreads,
+        proxyWorker: provider === 'wasm',
         async warmup() {
-          inputData.fill(0);
-          const tensor = new ort.Tensor('float32', inputData, [1, 3, inputSize, inputSize]);
+          const warmupData = new Float32Array(area * 3);
+          const tensor = new ort.Tensor('float32', warmupData, [1, 3, inputSize, inputSize]);
           const outputs = await session.run({ [inputName]: tensor });
           const output = outputs[outputName] || outputs[Object.keys(outputs)[0]];
           if (!output) throw new Error('The soccer model returned no output tensor.');
@@ -575,6 +575,9 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           const resizedHeight = Math.round(sourceHeight * scale);
           const padX = Math.floor((inputSize - resizedWidth) / 2);
           const padY = Math.floor((inputSize - resizedHeight) / 2);
+          // The WASM proxy transfers tensor buffers to its worker and detaches
+          // them here. Allocate per inference so later camera frames stay valid.
+          const inputData = new Float32Array(area * 3);
           inputContext.fillStyle = 'rgb(114,114,114)';
           inputContext.fillRect(0, 0, inputSize, inputSize);
           inputContext.drawImage(source, 0, 0, sourceWidth, sourceHeight,
@@ -620,6 +623,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           const ort = await import(runtimeUrl);
           ort.env.wasm.wasmPaths = ORT_DIST;
           ort.env.wasm.numThreads = wasmThreads;
+          ort.env.wasm.proxy = provider === 'wasm';
           const executionProviders = provider === 'webnn'
             ? [{ name: 'webnn', deviceType: 'npu', powerPreference: 'high-performance' }, 'wasm']
             : provider === 'webgpu' ? ['webgpu', 'wasm'] : ['wasm'];
@@ -711,7 +715,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       const wasmLabel = `${soccerDetector.wasmThreads}-thread WASM`;
       const providerLabel = soccerDetector.provider === 'webnn' ? `WebNN NPU requested · ${wasmLabel} fallback`
         : soccerDetector.provider === 'webgpu' ? `WebGPU · ${wasmLabel} fallback`
-          : `WebAssembly CPU · ${wasmLabel}`;
+          : `WebAssembly CPU · ${wasmLabel} · proxy worker`;
       detectorReadout.textContent = `Active detector: soccer YOLO (${modelName}) · ${providerLabel}`;
     }
 
