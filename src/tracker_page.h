@@ -553,13 +553,16 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const ORT_VERSION = '1.30.0';
     const ORT_DIST = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
     const SOCCER_MODEL_URL = 'https://raw.githubusercontent.com/StillPillWill/hand-tracker-esp32/soccer-camera-turret/model/soccer-yolo11n-1280-mobile.onnx';
+    const SOCCER_WASM_MODEL_URL = 'https://raw.githubusercontent.com/StillPillWill/hand-tracker-esp32/soccer-camera-turret/model/soccer-yolo11n-1280-mobile-int8.onnx';
     const BASELINE_SOCCER_MODEL_URL = 'https://raw.githubusercontent.com/StillPillWill/hand-tracker-esp32/soccer-camera-turret/model/soccer-yolo11n-1280.onnx';
     const SOCCER_MODEL_NAME = 'soccer-yolo11n-1280-mobile.onnx';
+    const SOCCER_WASM_MODEL_NAME = 'soccer-yolo11n-1280-mobile-int8.onnx';
     const BASELINE_SOCCER_MODEL_NAME = 'soccer-yolo11n-1280.onnx';
     const SOCCER_INPUT_SIZE = 1280;
     const SOCCER_CLASS_NAMES = ['ball', 'player', 'referee'];
     const SOCCER_CLASS_THRESHOLDS = [0.12, 0.18, 0.18];
     const PHONE_VIEW_CLASS_THRESHOLDS = [0.18, 0.18, 0.18];
+    const PHONE_VIEW_MODEL_NAMES = new Set([SOCCER_MODEL_NAME, SOCCER_WASM_MODEL_NAME]);
 
     function createSoccerOrtDetector(ort, session, provider, wasmThreads, classThresholds) {
       const inputName = session.inputNames[0];
@@ -709,7 +712,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           status(provider === 'webnn'
             ? 'Loading ONNX Runtime and requesting the phone NPU…'
             : provider === 'webgpu'
-              ? 'Loading ONNX Runtime and trying iPhone WebGPU…'
+              ? 'Loading ONNX Runtime and using this device’s WebGPU…'
               : 'Loading ONNX Runtime WebAssembly fallback…');
           const runtimeFile = provider === 'webnn' ? 'ort.all.min.mjs'
             : provider === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs';
@@ -829,7 +832,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         const offlineCacheReady = await ensureOfflineAssetCache();
         const modelBytes = await readModelBytes();
         status(`Loading soccer model (${(modelBytes.byteLength / 1048576).toFixed(1)} MB)…`);
-        const classThresholds = modelName === SOCCER_MODEL_NAME
+        const classThresholds = PHONE_VIEW_MODEL_NAMES.has(modelName)
           ? PHONE_VIEW_CLASS_THRESHOLDS : SOCCER_CLASS_THRESHOLDS;
         const soccerDetector = await setupSoccerDetector(modelBytes, classThresholds);
         setSoccerDetector(soccerDetector, modelName);
@@ -865,7 +868,15 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     async function downloadBundledSoccerModel() {
-      return downloadSoccerModel(SOCCER_MODEL_URL, SOCCER_MODEL_NAME, 'phone-view');
+      const model = getBundledSoccerModel();
+      return downloadSoccerModel(model.url, model.name, model.label);
+    }
+
+    function getBundledSoccerModel(nav = navigator) {
+      const hasAcceleratedProvider = getSoccerProviders(nav).some(provider => provider !== 'wasm');
+      return hasAcceleratedProvider
+        ? { url: SOCCER_MODEL_URL, name: SOCCER_MODEL_NAME, label: 'phone-view' }
+        : { url: SOCCER_WASM_MODEL_URL, name: SOCCER_WASM_MODEL_NAME, label: 'phone-view CPU-optimized' };
     }
 
     async function downloadBaselineSoccerModel() {
@@ -1412,7 +1423,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           if (saved?.bytes) {
             status('Loading the saved soccer model from this phone…');
             try {
-              const savedThresholds = saved.name === SOCCER_MODEL_NAME
+              const savedThresholds = PHONE_VIEW_MODEL_NAMES.has(saved.name)
                 ? PHONE_VIEW_CLASS_THRESHOLDS : SOCCER_CLASS_THRESHOLDS;
               const savedDetector = await setupSoccerDetector(new Uint8Array(saved.bytes), savedThresholds);
               if (request !== startToken) { savedDetector.close?.(); return; }
