@@ -22,7 +22,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
 
   <div class="card">
     <h2>Turret controls</h2>
-    <div class="row"><button id="motorToggle">Enable motors</button><button id="emergencyStop" class="stop">STOP + hold</button></div>
+    <div class="row"><button id="motorToggle" disabled>Checking ESP32…</button><button id="emergencyStop" class="stop">STOP + hold</button></div>
     <p id="motorState" class="small">Motors disabled. Confirm the camera mount is clear before enabling.</p>
     <label class="setting">Yaw speed limit: <span id="yawSpeedReadout" class="readout">45°/s</span>
       <input id="yawSpeed" type="range" min="5" max="60" step="1" value="45">
@@ -113,6 +113,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     const recordingLibrary = document.querySelector('#recordingLibrary');
 
     let detector = null, detectorKind = 'coco', detectorBusy = false, detectorFailed = false;
+    let controllerStateKnown = false;
     let genericDelegate = 'GPU', modelLoading = false;
     let stream = null, running = false, motorsEnabled = false, startToken = 0;
     let frameRequestId = 0, frameRequestKind = 'animation';
@@ -335,11 +336,53 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     function setMotorUi() {
+      if (!controllerStateKnown) {
+        motorBtn.textContent = 'Controller offline';
+        motorBtn.disabled = true;
+        motorBtn.classList.remove('enabled');
+        motorState.textContent = 'ESP32 state is unknown. Reconnect or reload before enabling the motors.';
+        return;
+      }
       motorBtn.textContent = motorsEnabled ? 'Disable motors' : 'Enable motors';
       motorBtn.classList.toggle('enabled', motorsEnabled);
       motorState.textContent = motorsEnabled
         ? 'Motors enabled. Keep the mount clear; use STOP if motion is unexpected.'
         : 'Motors disabled. Confirm the camera mount is clear before enabling.';
+    }
+
+    async function syncControllerState() {
+      motorBtn.disabled = true;
+      try {
+        const response = await fetch('/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`ESP32 status request returned ${response.status}`);
+        const state = await response.json();
+        if (state?.ok !== true || typeof state.enabled !== 'boolean') {
+          throw new Error('ESP32 returned an invalid controller status.');
+        }
+        controllerStateKnown = true;
+        motorsEnabled = state.enabled;
+        if (Number.isFinite(Number(state.yawSpeed))) yawSpeed.value = String(clamp(Number(state.yawSpeed), 5, 60));
+        if (Number.isFinite(Number(state.pitchSpeed))) pitchSpeed.value = String(clamp(Number(state.pitchSpeed), 5, 60));
+        updateReadouts();
+        setMotorUi();
+        status(motorsEnabled
+          ? 'ESP32 reports motors enabled. Disable them here before handling the mount.'
+          : 'ESP32 ready. Load a soccer model, then start the rear camera.');
+      } catch (error) {
+        motorsEnabled = false;
+        try {
+          await sendSettings();
+          controllerStateKnown = true;
+        } catch (_) {
+          controllerStateKnown = false;
+        }
+        setMotorUi();
+        status(controllerStateKnown
+          ? `Could not read ESP32 state; sent a disable command for safety. ${error?.message || error}`
+          : `Could not reach the ESP32; motor state is unknown. ${error?.message || error}`);
+      } finally {
+        motorBtn.disabled = !controllerStateKnown;
+      }
     }
 
     async function sendSettings() {
@@ -353,6 +396,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     }
 
     async function setMotors(enabled) {
+      if (!controllerStateKnown) {
+        status('Motor control is disabled because the ESP32 state is unknown. Reconnect and reload this page.');
+        return;
+      }
       const previous = motorsEnabled;
       motorsEnabled = enabled;
       setMotorUi();
@@ -366,7 +413,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         setMotorUi();
         status(`Could not update ESP32 motor state: ${error?.message || error}`);
       } finally {
-        motorBtn.disabled = false;
+        motorBtn.disabled = !controllerStateKnown;
       }
     }
 
@@ -1592,7 +1639,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     updateRecordingPlan();
     refreshRecordingStorageInfo();
     refreshRecordingLibrary();
-    sendSettings().catch(error => status(`Could not sync settings with the ESP32: ${error?.message || error}`));
+    syncControllerState();
   </script>
 </body>
 </html>

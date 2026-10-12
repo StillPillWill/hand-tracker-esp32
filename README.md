@@ -1,12 +1,12 @@
 # ESP32 Soccer Camera Turret
 
-The ESP32 provides the yaw/pitch motor controller and an open local Wi-Fi access point. An iPhone joins the access point and opens the Safari control page. Camera capture, detection, preview, and recording run on the phone; the ESP32 receives only target coordinates and motor settings.
+The ESP32 provides the yaw/pitch motor controller and an open local Wi-Fi access point with no password. An iPhone joins the access point and opens the Safari control page. Camera capture, detection, preview, and recording run on the phone; the ESP32 receives only target coordinates and motor settings.
 
-## Current prototype
+## Features
 
 - The ESP32 serves the control page at https://192.168.4.1:8000 on SoccerTurret-ESP32.
 - Safari requests the rear camera at up to 3840×2160 and 30 fps; the page displays the actual negotiated camera dimensions and frame rate. It requests microphone access only when recording starts, and records video without audio if mic permission is denied.
-- The page includes a **Download + load soccer model** action for the bundled three-class ONNX model. On first use, it downloads the 11 MB model through the phone's internet connection and saves it in Safari storage when available. Later sessions can load the saved copy. An ONNX file picker remains available for a custom model. If no soccer model is loaded, the general MediaPipe EfficientDet-Lite0 COCO detector is available as a fallback.
+- The page includes a baseline soccer model and an optional **Try phone-view model (experimental)** model. Either model downloads through the phone's internet connection and saves on the phone for later sessions. An ONNX file picker remains available for a custom model. If no soccer model is loaded, the general MediaPipe EfficientDet-Lite0 COCO detector is available as a fallback. See [model/README.md](model/README.md) for scores, licenses, and limitations.
 - The default focus-of-play mode estimates where the action is centered, rather than aiming only at the ball. It combines a visible or briefly predicted ball with nearby players. During longer occlusion it uses the fading recent ball position and scores player groups by proximity, movement toward play, convergence, activity, compactness, and continuity. Referees are not treated as play participants. Auto-frame stays wider around isolated detections and zooms in as a larger active group establishes the play. Ball-only and active-player-group modes are available.
 - The preview overlays detected balls and players; a green reticle marks the current calculated aim point and is labeled for the selected tracking mode.
 - Recording follows auto-framing without using the 1920-pixel preview canvas. When auto-framing can zoom, the page records a crop surface at the negotiated camera dimensions so the saved view follows the play; available camera hardware zoom is applied to its source frames. When auto-framing is off, MediaRecorder records the camera stream directly. The page writes each one-second media chunk into Safari's origin-private file storage through a worker, so a match recording does not accumulate as one huge in-memory blob. A configurable time limit, free-space estimate, screen-wake request when supported, and saved-recording list support long sessions. Stop recording, then tap a clip link to save it in Files; delete exported clips from Safari storage to reclaim space.
@@ -53,11 +53,11 @@ Default soft travel limits are ±70° yaw, +35° up, and −25° down. At boot, 
 
 ## Build and use
 
-1. Open this folder as a PlatformIO project and install its declared dependencies.
-2. Set STEPS_PER_REV, MICROSTEPS, gear ratios, direction inversion, and software limits near the top of src/main.cpp for the mount.
-3. Flash a classic ESP32 DevKit and open the serial monitor at 115200 baud. Wait for HTTPS certificate generation.
-4. Join SoccerTurret-ESP32 from the iPhone. If iOS warns that it has no internet, stay connected; external model and runtime downloads use the phone's internet connection when available.
-5. Open https://192.168.4.1:8000 and accept the local self-signed certificate warning. On first use, tap **Download + load soccer model**; Safari saves it locally when storage is available. If the phone cannot reach the repository, load the `.onnx` file from iPhone Files instead.
+1. Install PlatformIO Core or the VS Code PlatformIO extension, connect a classic ESP32 DevKit, and open this folder as the project.
+2. Set `STEPS_PER_REV`, `MICROSTEPS`, gear ratios, direction inversion, and software limits near the top of `src/main.cpp` for the actual mount. Center and level the camera before power-up; the firmware has no homing switches or encoders.
+3. Build with `pio run`. Flash with `pio run -t upload` (add `--upload-port COMx` if PlatformIO does not select the ESP32 port). Open serial at 115200 baud with `pio device monitor -b 115200 --port COMx`. Wait for the HTTPS certificate generation message.
+4. Join **SoccerTurret-ESP32** from the iPhone; the AP has no password. If iOS says the AP has no internet, stay connected so the phone can reach the ESP32 while using cellular for model/runtime downloads.
+5. Open **https://192.168.4.1:8000** and accept the local self-signed certificate warning so Safari can grant camera access. `localhost` would point to the iPhone itself; use the ESP32 address above. Load the baseline model or try the experimental phone-view model. If GitHub is unreachable, choose the `.onnx` file from iPhone Files instead.
 6. Tap **Start camera + tracker** and grant rear-camera permission. Grant microphone permission when starting a recording if you want audio. Enable the motors only after checking the turret is clear. Use STOP to halt and hold the camera; disabling the motors releases holding torque.
 
 The preview processes each decoded camera frame with Safari's `requestVideoFrameCallback()` when available, avoiding duplicate canvas work at the display refresh rate; other browsers fall back to animation frames. The preview drawing surface is capped at 1920 pixels wide, and detector inference is capped at about 8 times per second. The recording uses the source camera track instead.

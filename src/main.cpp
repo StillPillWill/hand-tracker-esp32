@@ -134,6 +134,19 @@ void handleRoot(HTTPRequest *req, HTTPResponse *res) {
   res->print(TRACKER_HTML);
 }
 
+void handleStatus(HTTPRequest *req, HTTPResponse *res) {
+  req->discardRequestBody();
+  char statusJson[128];
+  snprintf(statusJson, sizeof(statusJson),
+      "{\"ok\":true,\"enabled\":%s,\"yawSpeed\":%.1f,\"pitchSpeed\":%.1f}",
+      motorsEnabled ? "true" : "false",
+      yawAxis.speedLimitStepsPerSecond / yawAxis.stepsPerDegree,
+      pitchAxis.speedLimitStepsPerSecond / pitchAxis.stepsPerDegree);
+  res->setHeader("Content-Type", "application/json");
+  res->setHeader("Cache-Control", "no-store");
+  res->print(statusJson);
+}
+
 static bool readNormalizedParameter(ResourceParameters *params, const char *name, float &value) {
   std::string raw;
   if (!params->getQueryParameter(name, raw)) return false;
@@ -348,6 +361,7 @@ void setup() {
 
   httpsServer = new HTTPSServer(tlsCert, 8000, 2);
   httpsServer->registerNode(new ResourceNode("/", "GET", &handleRoot));
+  httpsServer->registerNode(new ResourceNode("/status", "GET", &handleStatus));
   httpsServer->registerNode(new ResourceNode("/target", "GET", &handleTarget));
   httpsServer->registerNode(new ResourceNode("/aim", "GET", &handleAim));
   httpsServer->registerNode(new ResourceNode("/settings", "POST", &handleSettings));
