@@ -121,7 +121,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
     let hardwareZoomPending = false, hardwareZoomNow = 1, lastZoomApply = 0;
     let lastTargetX = -1, lastTargetY = -1, previousBall = null, lastBallAt = 0;
     let ballVelocity = { x: 0, y: 0 }, previousPlayers = [], lastPlayersAt = 0;
-    let previousPlayFocus = null;
+    let previousPlayFocus = null, previousPlayFocusAt = 0;
     let recorder = null, recordingChunks = [];
     let recordingCanvas = null, recordingCanvasContext = null;
     let recordingCaptureStream = null, recordingMicStream = null, recordingOutputStream = null;
@@ -887,7 +887,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       return proximity * (0.35 + player.motion * 0.35 + Math.max(0, towardBall) * 0.5);
     }
 
-    function activePlayerGroup(players, ballHint = null) {
+    function activePlayerGroup(players, ballHint = null, now) {
       if (!players.length) return null;
       const radius = 0.19;
       let best = null;
@@ -918,8 +918,10 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
           ? Math.max(0, 1 - Math.hypot(x - ballHint.cx, y - ballHint.cy) / 0.45) * hintConfidence
           : 0;
         const engagement = group.reduce((sum, player) => sum + playerEngagement(player, ballHint), 0) / group.length * hintConfidence;
+        const focusAge = Math.max(0, now - previousPlayFocusAt);
         const continuity = previousPlayFocus
           ? Math.max(0, 1 - Math.hypot(x - previousPlayFocus.x, y - previousPlayFocus.y) / 0.38)
+            * clamp(1 - focusAge / 1400, 0, 1)
           : 0;
         const groupSize = clamp((group.length - 1) / 4, 0, 1);
         const score = groupSize * 0.32 + averageMotion * 0.20 + activeFraction * 0.10
@@ -979,7 +981,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       frameRequestId = 0;
     }
 
-    function calculateFocusOfPlay(ball, predictedBall, players, ballHint = null) {
+    function calculateFocusOfPlay(ball, predictedBall, players, ballHint, now) {
       const playAnchor = ball || predictedBall;
       if (playAnchor) {
         const nearbyPlayers = players.filter(player => Math.hypot(player.cx - playAnchor.cx, player.cy - playAnchor.cy) < 0.34);
@@ -994,7 +996,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         };
       }
 
-      const group = activePlayerGroup(players, ballHint);
+      const group = activePlayerGroup(players, ballHint, now);
       if (!group) return null;
       const source = group.ballProximity > 0.15
         ? 'active group near recent ball position'
@@ -1038,7 +1040,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         framingSubjects = [ball];
         focusLabel = 'Ball only · ' + Math.round(ball.score * 100) + '%';
       } else if (trackMode.value === 'play') {
-        const focus = calculateFocusOfPlay(ball, predicted, players, playHint);
+        const focus = calculateFocusOfPlay(ball, predicted, players, playHint, now);
         if (focus) {
           target = focus.target;
           framingSubjects = focus.framingSubjects;
@@ -1048,7 +1050,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       }
 
       if (!target && trackMode.value !== 'ball' && players.length) {
-        const group = activePlayerGroup(players, playHint);
+        const group = activePlayerGroup(players, playHint, now);
         if (group) {
           target = { x: group.x, y: group.y };
           framingSubjects = group.group;
@@ -1059,6 +1061,7 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
 
       if (target) {
         previousPlayFocus = { x: target.x, y: target.y };
+        previousPlayFocusAt = now;
         lastLockAt = now;
         const amount = 1 - Number(smoothing.value) / 100;
         filteredX += (target.x - filteredX) * amount;
@@ -1183,9 +1186,12 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         if (detector && !detectorBusy && !detectorFailed && now - lastInfer >= 120) {
           lastInfer = now;
           detectorBusy = true;
+          const inferenceToken = startToken;
           try {
             Promise.resolve(detector.detectForVideo(video, now))
-              .then(result => { if (running) updateTracking(result, performance.now()); })
+              .then(result => {
+                if (running && inferenceToken === startToken) updateTracking(result, performance.now());
+              })
               .catch(error => {
                 detectorFailed = true;
                 status(`Detection stopped: ${error?.message || error}. Reload the model or use the generic detector.`);
@@ -1277,6 +1283,12 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
         }
         if (request !== startToken) return;
         detectorFailed = false;
+        detections = [];
+        previousBall = null; lastBallAt = 0; ballVelocity = { x: 0, y: 0 };
+        previousPlayers = []; lastPlayersAt = 0;
+        previousPlayFocus = null; previousPlayFocusAt = 0;
+        filteredX = filteredY = 0.5; lastLockAt = 0; lastInfer = 0;
+        currentZoom = hardwareZoomActive ? hardwareZoomNow : 1;
         if (!running) { running = true; scheduleTrackerFrame(); }
         status('Tracking live. The phone sends only yaw/pitch targets to the ESP32.');
         startBtn.textContent = 'Tracker running';
@@ -1358,7 +1370,8 @@ const char TRACKER_HTML[] PROGMEM = R"TRACKER_PAGE(
       }
       stream?.getTracks().forEach(track => track.stop());
       stream = null; video.srcObject = null;
-      videoTrack = null; hardwareZoomRange = null; hardwareZoomActive = false; hardwareZoomPending = false;
+      videoTrack = null; hardwareZoomRange = null; hardwareZoomActive = false;
+      hardwareZoomPending = false; hardwareZoomNow = 1;
       updateCameraReadout();
       recordBtn.disabled = true; stopBtn.disabled = true;
       startBtn.disabled = false; startBtn.textContent = 'Start camera + tracker';
